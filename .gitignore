@@ -1,14 +1,27 @@
+
 # Python
 .venv/
 __pycache__/
 *.pyc
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.coverage
+htmlcov/
 
-# Secrets
+# Secrets / Credentials
 .env
 .env.*
 !.env.example
 *.key
+*.pem
+*.p12
+*.pfx
+.netrc
+secrets/
+credentials.json
+token.json
 
 # Datasets and checkpoints
 data/
@@ -21,6 +34,14 @@ wandb/
 *.pth
 *.ckpt
 *.safetensors
+*.onnx
+*.engine
+
+# Temporary camera captures (project root)
+/camera_test.jpg
+/camera_mjpg_test.jpg
+/lerobot_mjpg_test.png
+/video_frame_*.jpg
 
 # Logs
 *.log
@@ -28,4 +49,3 @@ wandb/
 # OS / Editor
 .DS_Store
 .vscode/
-EOF
