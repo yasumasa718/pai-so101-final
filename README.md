@@ -203,3 +203,13 @@ PY
 - **提出先**：omnicampus（PDF、GitHub URL、YouTube URL）
 
 提出物には、氏名・所属・メールアドレスなどの個人情報を含めないようにします。
+
+
+## main(提出物準備)
+## AI Model
+
+- Model: Google OWLv2
+- Model ID: google/owlv2-base-patch16-ensemble
+- Task: Zero-Shot Object Detection
+- License: Apache License 2.0
+- Source: https://huggingface.co/google/owlv2-base-patch16-ensemble
