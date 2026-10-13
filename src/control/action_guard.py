@@ -63,6 +63,19 @@ class ActionGuard:
         margin_gripper: float = 0.0,
     ) -> "ActionGuard":
         """Build limits from Follower JSON. Never alters the source file."""
+        return cls.from_calibration_bytes(
+            path.read_bytes(), margin_deg=margin_deg, margin_gripper=margin_gripper,
+        )
+
+    @classmethod
+    def from_calibration_bytes(
+        cls,
+        payload: bytes,
+        *,
+        margin_deg: float = 0.0,
+        margin_gripper: float = 0.0,
+    ) -> "ActionGuard":
+        """Build limits from the exact bytes checked by an offline startup gate."""
         for name, margin in (
             ("margin_deg", margin_deg),
             ("margin_gripper", margin_gripper),
@@ -74,8 +87,7 @@ class ActionGuard:
             ):
                 raise ValueError(f"{name} must be finite and nonnegative")
 
-        with path.open("r", encoding="utf-8") as stream:
-            data = json.load(stream)
+        data = json.loads(payload)
         if not isinstance(data, dict) or set(data) != set(MOTOR_IDS):
             raise ValueError("Follower calibration must contain exactly six SO-101 motors")
 
