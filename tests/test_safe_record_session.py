@@ -1,4 +1,4 @@
-"""Offline-only multi-frame episode orchestration tests. No motor or camera I/O."""
+"""複数フレームのエピソード管理をオフラインで検証する。モーターやカメラは操作しない。"""
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -84,7 +84,7 @@ class FakeDataset:
 
     def save_episode(self, episode_data=None, parallel_encoding=True):
         if self.fail_save:
-            self.episodes.append(list(self.pending))  # simulated partial disk write
+            self.episodes.append(list(self.pending))  # ディスクに一部だけ書き込まれた状況を再現する。
             raise OSError("half committed episode")
         self.episodes.append(list(self.pending))
         self.pending.clear()
@@ -191,7 +191,7 @@ def test_raw_f4_violation_aborts_entire_buffer_not_just_bad_frame():
     invalid["wrist_flex.pos"] = -105.0
     with pytest.raises(RecordFault):
         session.record_frame(invalid, observation())
-    assert len(robot.sent) == 1  # second frame was NEVER sent
+    assert len(robot.sent) == 1  # 2 フレーム目は送信されていないことを確認する。
     assert session.state is SessionState.FAULT
     assert session.fault.stage == "raw_guard"
     with pytest.raises(SessionStateError):
@@ -294,7 +294,7 @@ def test_image_staged_and_copied_before_send():
     obs = observation(camera=True)
     session.start()
     session.record_frame(action(), obs)
-    obs["top"][:] = 0  # original caller memory mutated after frame
+    obs["top"][:] = 0  # フレーム処理後に、呼び出し側が持つ元のデータを書き換える。
     assert np.all(ds.pending[0]["observation.images.top"] == 32)
     session.save_episode()
     session.finalize()
@@ -336,7 +336,7 @@ def test_normal_session_cannot_restart_or_abort_after_save():
 
 @pytest.fixture
 def follower_guard() -> ActionGuard:
-    """Read the repository's Follower snapshot, never the live device/cache."""
+    """リポジトリに保存した Follower 設定を読む。実機や実機用キャッシュにはアクセスしない。"""
     path = Path(__file__).resolve().parents[1] / "configs/calibration_snapshots/my_follower_for_004.json"
     before = path.read_bytes()
     result = ActionGuard.from_calibration(path)
@@ -350,14 +350,14 @@ def real_dataset(tmp_path: Path) -> Iterator[Any]:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     schema = features()
-    # Exercise action/state feature orders independently through the real API.
+    # 実際の API で、指令と観測の関節の並び順が別々でも正しく扱えるか試す。
     schema["action"]["names"] = list(reversed(JOINTS))
     ds = LeRobotDataset.create(
         repo_id="local/so101_offline_session_test", fps=30, features=schema,
         root=tmp_path / "session_integration", robot_type="so_follower", use_videos=False,
     )
-    # Close native file handles even in the injected save-failure test. This is
-    # test teardown, not session recovery/rollback; no buffers are discarded.
+    # 保存をわざと失敗させたテストでも、開いたファイルを最後に閉じる。
+    # これはテストの後片付けであり、異常復旧や保存前への復元ではない。一時データも消さない。
     close_dataset = ds.finalize
     try:
         yield ds
@@ -380,7 +380,7 @@ def read_frames(ds: Any) -> Any:
 
 
 def test_true_lerobot_dataset_roundtrip_without_hardware(real_dataset: Any, follower_guard: ActionGuard) -> None:
-    """Two real episodes: compare every returned target and captured state."""
+    """実際のデータセットに 2 エピソードを保存し、全フレームの戻り値の指令と観測値を比べる。"""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -402,7 +402,7 @@ def test_true_lerobot_dataset_roundtrip_without_hardware(real_dataset: Any, foll
             assert result.sent_action["gripper.pos"] != requested["gripper.pos"]
             expected_actions.append([result.sent_action[key] for key in ds.features["action"]["names"]])
             expected_states.append([obs[key] for key in ds.features["observation.state"]["names"]])
-        assert ds.meta.total_episodes == episode_index  # never auto-save
+        assert ds.meta.total_episodes == episode_index  # 自動ではエピソードを保存しないことを確認する。
         session.save_episode()
         assert session.state is SessionState.SAVED
         assert not ds.has_pending_frames()
@@ -462,7 +462,7 @@ def test_real_dataset_discards_fault_episode_preserving_saved_episode(
             if failure.startswith("final"):
                 session.loop.robot_action_processor = lambda payload: {**payload[0], key: invalid_value}
                 expected_stage = "final_command_guard"
-                invalid = action()  # raw action passes; final candidate must fail
+                invalid = action()  # 入力時の指令は通るが、加工後の最終候補は拒否される条件にする。
         with pytest.raises(RecordFault):
             session.record_frame(invalid, observation())
         assert session.state is SessionState.FAULT
@@ -497,7 +497,7 @@ def test_real_dataset_discards_fault_episode_preserving_saved_episode(
 def test_real_dataset_save_failure_keeps_uncertainty_and_forbids_retry(
     real_dataset: Any, follower_guard: ActionGuard, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failure AFTER a real save must never be reported as a rollback."""
+    """実際に保存した後で失敗した場合に、保存前の状態に戻せたと誤って扱わないことを確認する。"""
     ds = real_dataset
     robot = FakeRobot()
     session = real_session(ds, follower_guard, robot)
@@ -526,8 +526,8 @@ def test_real_dataset_save_failure_keeps_uncertainty_and_forbids_retry(
     assert session.fault is not None and session.fault.commit_uncertain
     assert session.writer.commit_uncertain
     assert session.writer.saved_episodes == 0
-    assert session.writer.frames_in_episode == 1  # uncertain local accounting retained
-    assert ds.meta.total_episodes == 1  # real persistence actually happened
+    assert session.writer.frames_in_episode == 1  # 保存が完了したか不明なので、保存処理側の件数を確定させない。
+    assert ds.meta.total_episodes == 1  # 実際の保存先には書き込まれていることを確認する。
     assert list((ds.root / "data").rglob("*.parquet"))
     for operation in (session.save_episode, session.abort_episode, session.finalize):
         with pytest.raises(SessionStateError):

@@ -213,6 +213,7 @@ class DataIntegrityResult:
 
     @property
     def passed(self) -> bool:
+        """データの欠損や時刻などの検査で、問題が見つからなかったかを返す。実機の安全判定ではない。"""
         return not self.issue_counts
 
 
@@ -235,6 +236,7 @@ class JointJumpCheck:
 
     @property
     def status(self) -> str:
+        """指令の変化量・変化速度の検査結果を返す。違反は FAIL、上限未指定は NOT_EVALUATED、それ以外は PASS。"""
         if self.step_violations or self.speed_violations:
             return "FAIL"
         if self.step_threshold is None and self.speed_threshold is None:

@@ -1,4 +1,4 @@
-"""Startup metadata checks using temporary files and a robot with no bus."""
+"""一時ファイルと通信機能のない模擬ロボットで、開始前の設定確認を試す。"""
 
 from __future__ import annotations
 
@@ -137,7 +137,7 @@ def test_matching_startup_records_evidence_without_modifying_inputs(case: Startu
     assert session.startup_result.margin_deg == 2.0
     assert session.startup_result.margin_gripper == 3.0
     assert session.startup_result.bounds == case.guard.bounds
-    assert case.robot.sent == []  # passing startup does not send anything
+    assert case.robot.sent == []  # 開始前の検査に通っても、指令は送信されないことを確認する。
     action = {key: 50.0 if key == "gripper.pos" else 0.0 for key in JOINTS}
     session.record_frame(action, action)
     session.save_episode()
@@ -158,7 +158,7 @@ def test_legacy_offline_session_has_no_startup_evidence(case: StartupCase) -> No
 
 def test_changed_file_after_session_construction_rejects_fixed_hash(case: StartupCase) -> None:
     session = session_for(case)
-    # Even a whitespace-only byte change must not be silently trusted.
+    # 空白だけの変更でも、事前に確認したファイルと同一とはみなさない。
     case.path.write_bytes(case.path.read_bytes() + b"\n")
     with pytest.raises(StartupCheckError, match="SHA-256 mismatch"):
         session.start()
@@ -302,7 +302,7 @@ def test_lerobot_metadata_and_dataset_supported_without_real_robot(case: Startup
     from lerobot.motors import MotorCalibration
     from lerobot.robots.so_follower.config_so_follower import SO101FollowerConfig
 
-    # Instantiate metadata only. No SOFollower, bus, port or camera is created.
+    # 設定の入れ物だけを作る。SOFollower、通信機能、ポート、カメラは作らない。
     case.robot.config = SO101FollowerConfig(port="offline_unused", use_degrees=True)
     case.robot.calibration = {
         motor: MotorCalibration(**entry) for motor, entry in case.calibration.items()

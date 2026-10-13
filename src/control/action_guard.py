@@ -1,11 +1,11 @@
-"""Offline SO-101 action-range gate (no hardware I/O).
+"""SO-101 の指令値が設定範囲内かを、実機に接続せず検査する。
 
-This module only checks that a complete action dictionary lies inside
-Follower calibration-derived *configured* position bounds. It neither
-commands motors nor certifies collision safety, motor load, or replay safety.
+6 関節分の指令の辞書を、Follower のキャリブレーションから求めた範囲と照合する。
+モーターへの指令送信は行わず、衝突・負荷・再生時の安全を保証するものでもない。
 
-LeRobot 0.6.1 with SO-101 use_degrees=True is assumed: F1-F5 use degrees,
-F6 uses normalized 0..100. Calibration values are assumed current and valid.
+LeRobot 0.6.1、SO-101 の use_degrees=True を前提にする。
+F1～F5 は度、F6 は 0～100 に換算した値を使う。
+キャリブレーションが現在の機器に対して有効であることは、別途確認が必要。
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ MOTOR_IDS: dict[str, int] = {
 
 @dataclass(frozen=True)
 class JointBound:
-    """Calibration-derived configured limits, not physical safety limits."""
+    """キャリブレーションから求めた設定上の範囲。実機の安全を保証する限界値ではない。"""
 
     action_key: str
     minimum: float
@@ -39,18 +39,18 @@ class JointBound:
 
 @dataclass(frozen=True)
 class ActionGuardResult:
-    """Result of a complete action dictionary check."""
+    """6 関節分の指令を検査した結果。"""
 
     accepted: bool
     reasons: tuple[str, ...]
-    # A copied, normalized action is returned only when the range checks pass.
-    # Its presence does NOT authorize hardware execution.
+    # 範囲の検査に通った場合だけ、数値の形式をそろえてコピーした指令を返す。
+    # この値が得られても、実機を動かしてよいという意味ではない。
     checked_action: dict[str, float] | None
 
 
 @dataclass(frozen=True)
 class ActionGuard:
-    """Read-only offline gate for LeRobot SO-101 action dictionaries."""
+    """LeRobot の SO-101 指令を、実機や設定を書き換えずに検査する。"""
 
     bounds: tuple[JointBound, ...]
 
@@ -62,7 +62,7 @@ class ActionGuard:
         margin_deg: float = 0.0,
         margin_gripper: float = 0.0,
     ) -> "ActionGuard":
-        """Build limits from Follower JSON. Never alters the source file."""
+        """Follower の JSON から検査範囲を作る。元のファイルは変更しない。"""
         return cls.from_calibration_bytes(
             path.read_bytes(), margin_deg=margin_deg, margin_gripper=margin_gripper,
         )
@@ -75,7 +75,7 @@ class ActionGuard:
         margin_deg: float = 0.0,
         margin_gripper: float = 0.0,
     ) -> "ActionGuard":
-        """Build limits from the exact bytes checked by an offline startup gate."""
+        """開始前の検査で確認したものと同じファイル内容から、検査範囲を作る。"""
         for name, margin in (
             ("margin_deg", margin_deg),
             ("margin_gripper", margin_gripper),
@@ -123,9 +123,9 @@ class ActionGuard:
         return cls(tuple(bounds))
 
     def check(self, action: Mapping[str, object]) -> ActionGuardResult:
-        """Fail closed on missing, extra, malformed or out-of-range entries.
+        """関節の不足・余分な項目・不正な値・範囲外の値があれば拒否する。
 
-        No clipping is performed: adjusting a target can change the motion.
+        範囲内に収めるための自動補正はしない。目標値を変えると動きも変わるため。
         """
         if not isinstance(action, Mapping):
             return ActionGuardResult(False, ("action: expected mapping",), None)

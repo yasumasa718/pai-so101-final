@@ -1,6 +1,6 @@
-"""Fake-robot only tests for the guarded one-frame recording boundary.
+"""1 フレームの収録処理を Fake Robot だけで検証する。
 
-No robot, serial bus, camera, real LeRobotDataset, or torque I/O is accessed.
+ロボット、シリアル通信、カメラ、実際の LeRobotDataset、トルク操作は使わない。
 """
 
 from __future__ import annotations
@@ -189,7 +189,7 @@ def test_send_failure_marks_uncertain_and_never_saves(guard):
         loop.process_frame(center_action(), {})
     assert caught.value.fault.stage == "send_action"
     assert caught.value.fault.send_status is SendStatus.UNCERTAIN
-    assert len(robot.sent_calls) == 1  # it might have reached the motor bus
+    assert len(robot.sent_calls) == 1  # 例外が起きても、指令がモーターに届いた可能性はある。
     assert saved == []
     assert loop.state is RecordState.FAULT
     assert robot.disconnect_calls == 0
@@ -263,13 +263,13 @@ def test_keyboard_interrupt_latches_fault_without_automatic_disconnect(guard):
 
 
 def test_real_guarded_teleop_pipeline_compatible(guard, tmp_path: Path):
-    """Exercise the existing LeRobot Processor in the user's LeRobot environment."""
+    """LeRobot が入った環境で、既存の指令加工処理と組み合わせて確認する。"""
     pytest.importorskip("lerobot")
     from src.control.guarded_record_processor import make_guarded_teleop_pipeline
     from lerobot.processor import make_default_robot_action_processor
 
-    # Reuse the fully validated calibration bounds from this fixture.
-    # LeRobot pipeline construction requires the JSON file, not the guard object.
+    # テスト用の共通準備で検証したキャリブレーションの範囲を再利用する。
+    # LeRobot の処理を組み立てる際は、検査オブジェクトではなく JSON ファイルを渡す必要がある。
     payload = {
         name: {
             "id": motor_id, "drive_mode": 0, "homing_offset": 0,

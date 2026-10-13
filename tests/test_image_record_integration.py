@@ -1,4 +1,4 @@
-"""Real LeRobot image/video lifecycle tests; no robot, camera or network I/O."""
+"""実際の LeRobot で画像・動画の保存から終了までを検証する。実機・カメラ・ネットワークは使わない。"""
 
 from __future__ import annotations
 
@@ -88,8 +88,8 @@ def make_recording(tmp_path: Path) -> Iterator[Callable[..., Recording]]:
             encoder_threads=1, video_backend="pyav",
             streaming_encoding=streaming,
         )
-        # Release native handles in test teardown, including quarantined cases.
-        # This never resets the adapter's FAULT/uncertainty or claims rollback.
+        # 使用禁止になったケースも、テスト終了時には開いたファイルを閉じる。
+        # 保存処理の FAULT や不確実な状態は解除せず、保存前に戻せたとも扱わない。
         closers.append(dataset.finalize)
         path = Path(__file__).resolve().parents[1] / "configs/calibration_snapshots/my_follower_for_004.json"
         payload = path.read_bytes()
@@ -125,7 +125,7 @@ def frame(recording: Recording, index: int) -> tuple[np.ndarray, list[float], li
     pixels = synthetic_image(index)
     expected_image = pixels.copy()
     result = recording.session.record_frame(requested, {**obs, "top": pixels})
-    pixels[:] = 0  # saved/staged pixels must be isolated from caller mutation
+    pixels[:] = 0  # 呼び出し側の画像を書き換えても、保存済み・預かり中の画素が変わらないことを確認する。
     features = recording.dataset.features
     return (expected_image, [result.sent_action[key] for key in features["action"]["names"]],
             [obs[key] for key in features["observation.state"]["names"]])
@@ -141,7 +141,7 @@ def decode_images(recording: Recording, table: pa.Table) -> list[np.ndarray]:
     if recording.mode == "image":
         result = []
         for value in table[CAMERA].to_pylist():
-            assert value["bytes"]  # PNGs embedded in Parquet; no temporary path dependency
+            assert value["bytes"]  # PNG は Parquet 内に埋め込まれており、一時ファイルの場所に依存しないことを確認する。
             with Image.open(io.BytesIO(value["bytes"])) as image:
                 result.append(np.array(image.convert("RGB")))
         return result
@@ -163,7 +163,7 @@ def assert_images(recording: Recording, table: pa.Table, expected: list[np.ndarr
             np.testing.assert_array_equal(actual, original)
         else:
             error = np.abs(actual.astype(np.int16) - original.astype(np.int16))
-            assert error.mean() < 3.0  # H.264/yuv420p is lossy; distinguish each frame's pattern
+            assert error.mean() < 3.0  # H.264/yuv420p は圧縮で画素値が少し変わるため、誤差を許しつつ各フレームの模様を確かめる。
             assert np.quantile(error, 0.95) <= 10
 
 
@@ -183,7 +183,7 @@ def assert_quarantined(recording: Recording) -> None:
     with pytest.raises(RecordStateError):
         session.loop.process_frame({}, {})
     assert len(recording.robot.calls) == calls
-    assert session.writer.commit_uncertain  # operations must not reset the evidence
+    assert session.writer.commit_uncertain  # 操作を試みても、異常の記録が消えないことを確認する。
 
 
 @pytest.mark.parametrize("mode", ["image", "video"])
@@ -279,7 +279,7 @@ def test_abort_waits_for_inflight_images_and_preserves_saved_episode(
                 recording.session.save_episode()
         worker.start()
         assert waiting.wait(2)
-        assert not finished.is_set()  # deletion must wait for the blocked native image writer
+        assert not finished.is_set()  # 待機中の画像保存が終わるまでは、ファイルを削除してはいけない。
         assert temporary.is_dir()
     finally:
         release.set()
@@ -289,7 +289,7 @@ def test_abort_waits_for_inflight_images_and_preserves_saved_episode(
     assert recording.session.state is SessionState.ABORTED
     assert not recording.dataset.has_pending_frames()
     assert not temporary.exists()
-    native.wait_until_done()  # no late write may recreate the deleted directory
+    native.wait_until_done()  # 遅れた書き込みで、削除済みのディレクトリが再び作られないことを確認する。
     assert not temporary.exists()
     assert recording.session.writer.frames_in_episode == 0
     assert len(recording.robot.calls) == 3 + (failure == "send")
@@ -322,10 +322,10 @@ def test_png_io_failure_does_not_save_normal_episode(
     frame(recording, 1)
     with pytest.raises((OSError, ValueError)):
         recording.session.save_episode()
-    assert "injected PNG disk failure" in caplog.text  # LeRobot logs rather than raises in write_image
+    assert "injected PNG disk failure" in caplog.text  # LeRobot の write_image は例外を伝えず、ログだけを残す。
     assert recording.session.state is SessionState.FAULT
     assert recording.session.writer.state is WriterState.FAULT
-    assert not recording.session.writer.commit_uncertain  # native save never entered
+    assert not recording.session.writer.commit_uncertain  # LeRobot 側のエピソード保存は始まっていないことを確認する。
     assert recording.dataset.meta.total_episodes == 0
     assert recording.session.writer.saved_episodes == 0
     assert recording.dataset.has_pending_frames()
@@ -441,7 +441,7 @@ def test_partial_parquet_failure_keeps_uncertainty(
     assert calls == 1
     assert recording.dataset.meta.total_episodes == 0
     assert list((recording.dataset.root / "data").rglob("*.parquet"))
-    assert list(recording.dataset.root.rglob("*.png"))  # quarantine, not implicit deletion
+    assert list(recording.dataset.root.rglob("*.png"))  # 異常なデータを勝手に削除せず、使用禁止にすることを確認する。
 
 
 def test_video_encoding_failure_preserves_previous_video_and_partial_files(
@@ -497,7 +497,7 @@ def test_cleanup_failure_never_reports_successful_abort(
     assert recording.session.state is SessionState.FAULT
     assert recording.session.writer.state is WriterState.FAULT
     assert recording.session.writer.frames_in_episode == 1
-    assert not recording.dataset.has_pending_frames()  # native cleanup happened; adapter cannot certify success
+    assert not recording.dataset.has_pending_frames()  # LeRobot 側で後片付けが進んでいても、保存処理側では成功したと保証できない。
     assert calls == 1 and recording.dataset.meta.total_episodes == 0
     with pytest.raises(SessionStateError):
         recording.session.finalize()

@@ -1,8 +1,8 @@
-"""LeRobot 0.6.1 teleoperation action guard processor (offline-tested adapter).
+"""LeRobot 0.6.1 の手動操作の指令を検査する、オフライン検証用の処理。
 
-Do NOT enable this step in a live recording until handling a rejected action,
-shutdown / torque release, and logging have been reviewed and tested safely.
-The processor itself does not access any robot, serial port, or camera.
+実機収録に組み込む前に、指令を拒否したときの対応、終了、トルク解除、
+ログの扱いを確認し、安全な条件で試験すること。
+この処理自体は、ロボット・シリアルポート・カメラにアクセスしない。
 """
 
 from __future__ import annotations
@@ -23,23 +23,24 @@ from src.control.action_guard import ActionGuard
 
 
 class GuardRejectedError(RuntimeError):
-    """A position command violates the configured offline range gate."""
+    """位置の指令が、設定した範囲の検査に通らなかったことを表す例外。"""
 
 
 @dataclass
 class GuardedTeleopActionStep(RobotActionProcessorStep):
-    """Checks complete SO-101 teleop action dicts, never clips/repairs them."""
+    """SO-101 の全関節の手動操作指令を検査する。値の切り詰めや補正はしない。"""
 
     guard: ActionGuard
 
     def action(self, action: RobotAction) -> RobotAction:
+        """手動操作の指令を範囲検査し、通った指令を返す。違反があれば補正せず例外で知らせる。"""
         checked = self.guard.check(action)
         if not checked.accepted or checked.checked_action is None:
             raise GuardRejectedError("; ".join(checked.reasons))
         return checked.checked_action
 
     def transform_features(self, features: dict[Any, Any]) -> dict[Any, Any]:
-        """This gate does not change the type, shape, or names of features."""
+        """この検査では、特徴量の型・形・名前を変更しない。"""
         return features
 
 
@@ -51,7 +52,7 @@ def make_guarded_teleop_pipeline(
 ) -> RobotProcessorPipeline[
     tuple[RobotAction, RobotObservation], RobotAction
 ]:
-    """Build a processor for offline tests; no hardware interaction occurs."""
+    """オフラインテスト用の処理を作る。実機は操作しない。"""
     guard = ActionGuard.from_calibration(
         calibration_path,
         margin_deg=margin_deg,

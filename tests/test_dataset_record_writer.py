@@ -1,7 +1,7 @@
-"""Offline tests for LeRobot v0.6.1 dataset action/observation writer.
+"""LeRobot 0.6.1 向けの指令・観測の保存処理を、オフラインで検証する。
 
-FakeDataset contains no motors, camera connections, disks, or network access.
-One optional integration test creates an ephemeral LeRobotDataset with no robot.
+FakeDataset はモーター・カメラ・ディスク・ネットワークにアクセスしない。
+実際の LeRobotDataset を使う統合テストも、一時保存先で行いロボットは使わない。
 """
 
 from __future__ import annotations
@@ -64,14 +64,14 @@ class FakeDataset:
 
     def add_frame(self, frame: dict[str, Any]) -> None:
         if self.fail_add:
-            # Simulate partial mutation before the I/O/API exception.
+            # 例外の前にデータが一部だけ変わる失敗を再現する。
             self.added.append(frame)
             raise OSError("simulated add_frame error")
         self.added.append(frame)
 
     def save_episode(self, episode_data=None, parallel_encoding=True) -> None:
         if self.fail_save:
-            self.saved.append(list(self.added))  # partial write on disk
+            self.saved.append(list(self.added))  # ディスクへの書き込みが一部だけ進んだ状態を再現する。
             raise OSError("simulated half-written parquet")
         self.saved.append(list(self.added))
         self.added.clear()
@@ -101,7 +101,7 @@ def test_one_frame_is_buffered_with_sent_action_and_task(dataset):
     writer(sent)
     assert writer.state is WriterState.READY
     assert writer.frames_in_episode == 1
-    assert dataset.saved == []  # never commit per frame
+    assert dataset.saved == []  # 各フレームを追加しただけでは、エピソードを保存しない。
     stored = dataset.added[0]
     assert set(stored) == {"action", "observation.state", "task"}
     assert stored["task"] == "Pick the crushed can"
@@ -253,7 +253,7 @@ def test_abort_never_finalizes_or_disconnects(dataset):
     assert writer.state is WriterState.ABORTED
     assert dataset.added == dataset.saved == []
     assert dataset.finalizes == 0
-    writer.finalize()  # explicit cleanup only after buffer discarded
+    writer.finalize()  # 一時データを明示的に捨てた後だけ、終了処理を行う。
     assert dataset.finalizes == 1
 
 
@@ -287,7 +287,7 @@ def test_finalize_fails_for_unsaved_episode(dataset):
 
 
 def test_safe_record_loop_callback_contract(tmp_path: Path):
-    """Pair the real one-frame guard/controller with fake writer and sender."""
+    """実際の 1 フレーム収録ループと検査を、模擬の保存先・送信先につないで検証する。"""
     from src.control.action_guard import ActionGuard, MOTOR_IDS
     from src.control.safe_record_loop import RecordFault, SafeRecordLoop, RecordState
     import json
@@ -360,7 +360,7 @@ def test_safe_record_loop_fault_requires_explicit_dataset_abort(tmp_path: Path):
     with pytest.raises(RecordFault):
         loop.process_frame(bad, observation())
     assert loop.state is RecordState.FAULT
-    assert writer.state is WriterState.STAGED  # explicit abort by supervisor
+    assert writer.state is WriterState.STAGED  # 収録を管理する側が、明示的に中断する。
     with pytest.raises(DatasetWriterStateError):
         writer.save_episode()
     writer.abort_episode()
@@ -368,7 +368,7 @@ def test_safe_record_loop_fault_requires_explicit_dataset_abort(tmp_path: Path):
 
 
 def test_real_lerobot_dataset_roundtrip_without_robot(tmp_path: Path):
-    """Run only in user's WSL2 environment with LeRobot 0.6.1 installed."""
+    """LeRobot 0.6.1 をインストールした WSL2 環境で実行する統合テスト。"""
     pytest.importorskip("lerobot")
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     import pyarrow.parquet as pq
@@ -429,7 +429,7 @@ def test_writer_failure_does_not_allow_save_even_after_partial_frame(dataset):
     dataset.fail_add = True
     with pytest.raises(OSError):
         writer(action())
-    assert len(dataset.added) == 1  # fake mimics a partial side effect
+    assert len(dataset.added) == 1  # 失敗までに一部の処理が進んだ状態を、模擬データセットで再現する。
     assert writer.state is WriterState.FAULT
     with pytest.raises(DatasetWriterStateError):
         writer.save_episode()

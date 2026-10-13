@@ -1,4 +1,4 @@
-"""Offline pipeline tests: no robot/serial/camera access."""
+"""指令を順番に加工・検査する処理をオフラインで試す。実機・シリアル通信・カメラは使わない。"""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def test_f4_violation_rejected_before_output(calibration_path: Path) -> None:
 
 
 def test_saved_action_and_robot_action_identity_path_match(calibration_path: Path) -> None:
-    """Models the two processing calls in record_loop, NOT a hardware send."""
+    """record_loop 内の 2 段階の加工を再現する。実機への送信は行わない。"""
     teleop_action_processor = make_guarded_teleop_pipeline(calibration_path)
     robot_action_processor = make_default_robot_action_processor()
     original = center_action()

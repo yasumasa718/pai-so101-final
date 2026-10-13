@@ -1,4 +1,4 @@
-"""Offline tests for the SO-101 action range gate. No serial/camera I/O."""
+"""SO-101 の指令範囲をオフラインで検証する。シリアル通信やカメラは使わない。"""
 
 import json
 import math
@@ -11,7 +11,7 @@ from src.control.action_guard import ActionGuard, MOTOR_IDS
 
 @pytest.fixture
 def calibration_file(tmp_path: Path) -> Path:
-    # F2/F4 correspond to the latest ranges the user reported (2026-10-13).
+    # F2/F4 は、2026-10-13 にユーザーが報告した範囲に合わせる。
     limits = {
         "shoulder_pan": (792, 3306),
         "shoulder_lift": (826, 3209),

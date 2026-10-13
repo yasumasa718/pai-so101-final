@@ -1,94 +1,112 @@
-"""Fail-closed LeRobotDataset v0.6.1 episode writer for the SO-101.
+"""SO-101 のエピソードを LeRobotDataset 0.6.1 に保存し、異常時には処理を止める。
 
-Offline-capable adapter for SafeRecordLoop.frame_writer. It is intentionally
-NOT an executable robot recorder. It never opens a serial port, starts motors,
-releases torque, acquires images, or invokes LeRobot's CLI record().
+SafeRecordLoop.frame_writer に渡す、オフライン検証が可能な部品。
+単体で実機収録を行うプログラムではない。
+シリアルポートの接続、モーターの始動、トルク解除、画像取得、LeRobot CLI は実行しない。
 
-Typical SINGLE-threaded orchestration, after an independent safety review::
+別途安全性を確認した上で、一つのスレッドから次の順に操作する::
 
     writer = DatasetRecordWriter(dataset, task="Pick the crushed can")
-    # For each frame, BEFORE SafeRecordLoop.process_frame():
-    writer.stage_observation(obs_processed)  # already acquired observation
-    loop.process_frame(raw_action, obs)        # sends once, calls writer(sent)
-    # Only after an entire episode has finished without any fault:
+    # 各フレームで、送信より先に取得済みの観測を預ける。
+    writer.stage_observation(obs_processed)
+    loop.process_frame(raw_action, obs)  # 1 回送信し、戻り値を writer に渡す。
+    # エピソード全体が異常なく終わった場合だけ保存する。
     loop.finish()
     writer.save_episode()
-    # When completely finished:
+    # すべての収録が終わったら保存処理を閉じる。
     writer.finalize()
 
-On any fault: do NOT call save_episode(). Do not retry a send. After safely
-handling the robot independently, call writer.abort_episode() to discard the
-in-memory episode. A failed save_episode() may have partially written files;
-this adapter cannot guarantee rollback, so the dataset must be quarantined.
+異常時には save_episode() を呼ばず、送信も再試行しない。
+ロボットの状態に別途対処した後、quarantine_required が False の場合だけ
+abort_episode() で未保存の一時データを捨てる。
+画像保存や後片付けの異常では、処理が戻ってもファイルの変更が続く可能性があるため、
+データを消す後片付けは禁止する。
+LeRobot の save_episode() が失敗した場合も、一部だけ保存されている可能性がある。
+元に戻せたとは保証できないため、データセットを使用禁止にする。
 
-No hardware or real-time safety guarantees are provided. build_dataset_frame
-behavior mirrors LeRobot 0.6.1 for six-joint vector + optional image/video
-observations. LeRobot owns timestamps, frame indices, and episode indices.
+実機の安全や、決められた時間内での処理完了を保証するものではない。
+フレームの組み立ては、LeRobot 0.6.1 の 6 関節の値と画像・動画の観測形式に合わせる。
+時刻、フレーム番号、エピソード番号は LeRobot が管理する。
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 import numpy as np
 from PIL import Image
 
 from src.control.action_guard import MOTOR_IDS
+from src.control.bounded_image_writer import BoundedImageWriter, ImageWorkerError
+from src.control.dataset_quarantine import DatasetQuarantinedError, assert_dataset_not_quarantined, record_dataset_quarantine
 
 logger = logging.getLogger(__name__)
 JOINT_KEYS = frozenset(f"{name}.pos" for name in MOTOR_IDS)
 
 
 class DatasetLike(Protocol):
-    """Small LeRobotDataset 0.6.1 contract, also implemented by test fakes."""
+    """この保存処理が使う LeRobotDataset 0.6.1 の最低限の機能。テスト用の偽物も同じ形にする。"""
 
     features: dict[str, dict[str, Any]]
 
-    def add_frame(self, frame: dict[str, Any]) -> None: ...
+    def add_frame(self, frame: dict[str, Any]) -> None:
+        """観測と指令を含む 1 フレームを追加するための呼び出し形を定める。実際の処理は保存先が実装する。"""
+        ...
 
-    def save_episode(self, episode_data: dict | None = None, parallel_encoding: bool = True) -> None: ...
+    def save_episode(self, episode_data: dict | None = None, parallel_encoding: bool = True) -> None:
+        """エピソードを保存するための呼び出し形を定める。ここでは保存処理そのものは実装しない。"""
+        ...
 
-    def clear_episode_buffer(self, delete_images: bool = True) -> None: ...
+    def clear_episode_buffer(self, delete_images: bool = True) -> None:
+        """未保存の一時データを捨てるための呼び出し形を定める。delete_images で画像も削除するかを指定する。"""
+        ...
 
-    def finalize(self) -> None: ...
+    def finalize(self) -> None:
+        """データセットの書き込みを終了するための呼び出し形を定める。実際の処理は保存先が実装する。"""
+        ...
 
 
 class WriterState(str, Enum):
-    READY = "ready"       # active episode can be staged; may contain frames
-    STAGED = "staged"     # one observation waiting for returned sent_action
-    FAULT = "fault"       # write/staging/save failed; no further writes
-    ABORTED = "aborted"   # in-memory episode discarded; no reuse
-    FINALIZED = "finalized"
+    READY = "ready"       # 観測を受け付けられる状態。未保存のフレームがある場合もある。
+    STAGED = "staged"     # 観測を一つ預かり、送信後の指令値を待っている状態。
+    FAULT = "fault"       # 観測の準備や保存で失敗した状態。追加の書き込みは禁止。
+    ABORTED = "aborted"   # メモリ内のエピソードを捨てた状態。この writer は再利用しない。
+    FINALIZED = "finalized"  # 保存処理を閉じた状態。追加の収録はできない。
 
 
 class DatasetWriterStateError(RuntimeError):
-    """Operation not permitted with this episode-writer state."""
+    """保存処理の現在の状態では、要求された操作ができないことを表す例外。"""
 
 
 @dataclass
 class DatasetRecordWriter:
-    """Append synchronized observations and *returned sent commands*.
+    """対応する観測と、送信後に返された指令値を組にして記録する。
 
-    - Caller must stage the observation for each frame BEFORE a possible send.
-    - Only the action returned by SOFollower.send_action may be passed to __call__.
-      Calling with a requested action is a caller contract violation, not
-      something this class can independently detect.
-    - Exactly one staged observation is consumed per successful add_frame.
-    - The dataset buffer is committed *only* by explicit save_episode().
-    - If any exception occurs, the writer latches FAULT. It never auto-saves.
-    - Do not share this object between threads or simultaneous recording loops.
+    各フレームでは、送信前に stage_observation() で観測を預ける。
+    __call__() に渡してよいのは SOFollower.send_action() の戻り値だけ。
+    要求しただけの指令が渡されても、このクラス単独では区別できないので呼び出し側で守る。
+    add_frame() が成功するたびに、預かった観測を一つ使う。
+    データセットへの保存は、明示的に save_episode() を呼んだときだけ行う。
+    異常時は FAULT を保持し、自動保存しない。
+    複数のスレッドや収録ループから同時に使わないこと。
     """
 
     dataset: DatasetLike
     task: str
+    image_timeout_s: float = field(default=5.0, kw_only=True)  # 画像処理を待つ上限秒数。収録全体の制限時間ではない。
     state: WriterState = field(default=WriterState.READY, init=False)
     frames_in_episode: int = field(default=0, init=False)
     saved_episodes: int = field(default=0, init=False)
-    commit_uncertain: bool = field(default=False, init=False)
+    commit_uncertain: bool = field(default=False, init=False)  # 保存・終了処理がどこまで進んだか確定できない。
+    cleanup_uncertain: bool = field(default=False, init=False)  # 画像処理や後片付けの完了を確認できない。
+    quarantine_record: Path | None = field(default=None, init=False)  # データセットの使用禁止を示すファイルの場所。
+    quarantine_record_error: str | None = field(default=None, init=False)  # 使用禁止の印を保存できなかった場合の例外名。
     fault_message: str | None = field(default=None, init=False)
     _staged: dict[str, Any] | None = field(default=None, init=False, repr=False)
     _action_names: tuple[str, ...] = field(default=(), init=False, repr=False)
@@ -96,6 +114,12 @@ class DatasetRecordWriter:
     _image_features: dict[str, dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        """作成直後に、使用禁止の印、保存先の機能、記録項目の形式を確認し、画像保存の待ち時間制限を組み込む。"""
+        root = getattr(self.dataset, "root", None)
+        if root is not None:
+            assert_dataset_not_quarantined(Path(root))
+        if type(self.image_timeout_s) not in (int, float) or not math.isfinite(self.image_timeout_s) or not 0 < self.image_timeout_s <= threading.TIMEOUT_MAX:
+            raise ValueError("image_timeout_s must be finite and positive")
         if not isinstance(self.task, str) or not self.task.strip():
             raise ValueError("task must be a non-empty string")
         if not isinstance(getattr(self.dataset, "features", None), dict):
@@ -109,8 +133,8 @@ class DatasetRecordWriter:
             raise ValueError("Streaming encoding is not supported by the guarded image-file validation")
         self._action_names = self._validate_joint_feature(features, "action")
         self._state_names = self._validate_joint_feature(features, "observation.state")
-        # Only explicitly supported SO-101 features. Fail before recording if
-        # the feature schema would require a field we silently omit.
+        # 対応している SO-101 の項目だけを受け付ける。必要な項目を記録し忘れないよう、
+        # 未対応の項目が必要な形式なら、収録前にエラーにする。
         defaults = {"index", "episode_index", "frame_index", "timestamp", "task_index"}
         for key, spec in features.items():
             if key in defaults or key in {"action", "observation.state"}:
@@ -125,9 +149,53 @@ class DatasetRecordWriter:
             ):
                 raise ValueError(f"Unsupported dataset feature: {key}")
             self._image_features[key] = spec
+        if native_writer is not None and native_writer.image_writer is not None:
+            current = native_writer.image_writer
+            if isinstance(current, BoundedImageWriter):
+                if current.timeout_s != self.image_timeout_s:
+                    raise ValueError("Existing bounded image writer uses a different timeout")
+            else:
+                native_writer.image_writer = BoundedImageWriter(current, timeout_s=self.image_timeout_s)
+
+    @property
+    def quarantine_required(self) -> bool:
+        """保存や後片付けの結果が不明で、データセットを使用禁止にする必要があるかを返す。"""
+        return self.commit_uncertain or self.cleanup_uncertain
+
+    def check_quarantine(self) -> None:
+        """開始・使用前に、ファイルやメモリに使用禁止の印が付いていないかを再確認する。"""
+        root = getattr(self.dataset, "root", None)
+        if root is not None:
+            try:
+                assert_dataset_not_quarantined(Path(root))
+            except DatasetQuarantinedError as exc:
+                self._fault("quarantine_check", exc, uncertain_cleanup=True)
+                raise
+
+    def _check_image_worker(self, *, wait: bool = False) -> None:
+        """使用禁止の印と画像保存処理の状態を確認する。wait=True なら保存待ちの画像の処理完了も待つ。"""
+        self.check_quarantine()
+        native = getattr(self.dataset, "writer", None)
+        worker = getattr(native, "image_writer", None)
+        if worker is not None:
+            if not isinstance(worker, BoundedImageWriter):
+                raise ImageWorkerError("Image writer was replaced outside the guarded supervisor")
+            if wait:
+                worker.wait_until_done()
+            else:
+                worker.check_health()
+
+    def check_workers(self) -> None:
+        """セッションを開始する前に、画像保存用の処理が動いているかを確認する。"""
+        try:
+            self._check_image_worker()
+        except BaseException as exc:
+            self._fault("image_worker_health", exc)
+            raise
 
     @staticmethod
     def _validate_joint_feature(features: dict, key: str) -> tuple[str, ...]:
+        """保存形式が float32 の 6 関節分であることを確認し、データセットが指定する関節の並び順を返す。"""
         spec = features.get(key)
         if not isinstance(spec, dict) or spec.get("dtype") != "float32":
             raise ValueError(f"{key}: expected float32 feature")
@@ -142,6 +210,7 @@ class DatasetRecordWriter:
 
     @staticmethod
     def _joint_vector(action: Mapping[str, object], names: tuple[str, ...], source: str) -> np.ndarray:
+        """関節値を指定の順番で float32 の配列にする。数値の不足・不正な値・変換時の桁あふれは拒否する。"""
         if not isinstance(action, Mapping) or set(action) != JOINT_KEYS:
             raise ValueError(f"{source}: expected exactly six joint keys")
         values: list[float] = []
@@ -149,7 +218,7 @@ class DatasetRecordWriter:
             raw = action[key]
             if type(raw) not in (float, int) or not math.isfinite(raw):
                 raise ValueError(f"{source}.{key}: expected finite number")
-            # Use the actual float32 values which LeRobot serializes.
+            # LeRobot が保存する float32 形式にそろえた値を使う。
             values.append(float(raw))
         array = np.asarray(values, dtype=np.float32)
         if not np.isfinite(array).all():
@@ -157,6 +226,7 @@ class DatasetRecordWriter:
         return array
 
     def _make_observation_frame(self, observation: Mapping[str, Any]) -> dict[str, Any]:
+        """観測の項目と画像形式を確認し、保存用の関節配列と画像コピーをまとめる。観測の取得自体は行わない。"""
         if not isinstance(observation, Mapping):
             raise ValueError("observation: expected mapping")
         expected = JOINT_KEYS | {key.removeprefix("observation.images.") for key in self._image_features}
@@ -173,25 +243,42 @@ class DatasetRecordWriter:
                 raise ValueError(f"{key}: expected uint8 ndarray")
             if value.shape != tuple(spec["shape"]):
                 raise ValueError(f"{key}: expected image shape {spec['shape']}, got {value.shape}")
-            frame[key] = value.copy()  # avoid caller mutating after capture
+            frame[key] = value.copy()  # 呼び出し側が後で値を書き換えても、預かった観測が変わらないようコピーする。
         return frame
 
-    def _fault(self, stage: str, error: BaseException, *, uncertain_commit: bool = False) -> None:
+    def _fault(self, stage: str, error: BaseException, *, uncertain_commit: bool = False, uncertain_cleanup: bool = False) -> None:
+        """FAULT と異常の内容を記録し、預かり中の観測を解除する。保存や後片付けの結果が不明なら使用禁止の印も残す。"""
         self.state = WriterState.FAULT
         self.commit_uncertain = self.commit_uncertain or uncertain_commit
+        self.cleanup_uncertain = self.cleanup_uncertain or uncertain_cleanup or isinstance(error, ImageWorkerError)
         self.fault_message = f"{stage}: {type(error).__name__}: {error}"
         self._staged = None
         logger.error("SO-101 dataset writer FAULT: %s", self.fault_message)
+        if self.quarantine_required:
+            try:
+                root = getattr(self.dataset, "root", None)
+                if root is None:
+                    raise ValueError("No local dataset root for quarantine record")
+                self.quarantine_record = record_dataset_quarantine(
+                    Path(root), stage=stage, error_type=type(error).__name__,
+                    commit_uncertain=self.commit_uncertain, cleanup_uncertain=self.cleanup_uncertain,
+                    frames_in_episode=self.frames_in_episode, saved_episodes=self.saved_episodes,
+                )
+            except Exception as record_error:
+                # 空き容量不足や書き込み禁止で印を保存できなくても、元の異常を失わないようにする。
+                self.quarantine_record_error = type(record_error).__name__
+                logger.error("Quarantine record failed: %s; dataset remains excluded", self.quarantine_record_error)
 
     def stage_observation(self, observation: Mapping[str, Any]) -> None:
-        """Stage exactly one *already acquired* observation before sending.
+        """送信前に、取得済みの観測を一つだけ預かる。
 
-        Must be called once per frame, immediately before process_frame().
-        Failure latches FAULT and must prevent any subsequent motor send.
+        各フレームの process_frame() の直前に 1 回呼ぶ。
+        失敗したら FAULT を保持する。呼び出し側は、その後の指令送信を行ってはならない。
         """
         if self.state is not WriterState.READY:
             raise DatasetWriterStateError(f"Cannot stage from {self.state.value}")
         try:
+            self._check_image_worker()
             self._staged = self._make_observation_frame(observation)
             self.state = WriterState.STAGED
         except BaseException as exc:
@@ -199,15 +286,16 @@ class DatasetRecordWriter:
             raise
 
     def __call__(self, sent_action: Mapping[str, object]) -> None:
-        """FrameWriter callback; append only command returned by send_action().
+        """send_action() の戻り値の指令だけを、預かり中の観測と一緒に一時保存する。
 
-        LeRobot v0.6.1 computes timestamp/frame_index itself. No external
-        caller should add them to this frame. This is a buffered append,
-        NOT a durable disk commit.
+        SafeRecordLoop が保存先として呼び出すメソッド。
+        LeRobot 0.6.1 が timestamp と frame_index を計算するため、外部で追加しない。
+        この段階は一時データへの追加であり、ディスクへの保存完了ではない。
         """
         if self.state is not WriterState.STAGED or self._staged is None:
             raise DatasetWriterStateError(f"Cannot write frame from {self.state.value}")
         try:
+            self._check_image_worker()
             action = self._joint_vector(sent_action, self._action_names, "sent_action")
             frame = {
                 **self._staged,
@@ -223,25 +311,24 @@ class DatasetRecordWriter:
             raise
 
     def _validate_pending_images(self) -> None:
-        """Check EVERY staged RGB file after async writes, before native save.
+        """画像の書き込みを待ち、LeRobot の保存前に全 RGB 画像を確認する。
 
-        LeRobot 0.6.1 write_image() logs disk failures without propagating them.
-        Its statistics sample frames and video encoding enumerates existing
-        files: a missing unsampled PNG can otherwise silently shorten a video.
+        LeRobot 0.6.1 の write_image() は、ディスク書き込みの失敗をログに残すだけで、
+        呼び出し側へ例外を伝えない。また、統計計算では画像の一部しか調べず、
+        動画変換では存在するファイルだけを使う。そのため、検査しなかった PNG が
+        欠けていると、エラーにならず短い動画ができてしまう。ここでは全画像を調べて防ぐ。
 
-        The native writer/episode_buffer interface is specific to LeRobot 0.6.1.
-        In-memory DatasetLike fakes have no native writer or backing files.
-        Streaming encoding is rejected at construction (no image-file buffer).
-        This check is not a transaction or a physical motion safety mechanism.
+        画像保存処理と episode_buffer の扱いは LeRobot 0.6.1 専用。
+        メモリだけを使うテスト用 DatasetLike には、これらの処理や画像ファイルはない。
+        画像ファイルを一時保存しないストリーミング変換は、作成時に受け付けない。
+        この検査は、失敗時に元に戻ることや、実機の動作の安全を保証するものではない。
         """
         if not self._image_features:
             return
         native_writer = getattr(self.dataset, "writer", None)
         if native_writer is None:
             return
-        async_writer = getattr(native_writer, "image_writer", None)
-        if async_writer is not None:
-            async_writer.wait_until_done()
+        self._check_image_worker(wait=True)
         buffer = getattr(native_writer, "episode_buffer", None)
         if not isinstance(buffer, dict) or buffer.get("size") != self.frames_in_episode:
             raise ValueError("Image episode buffer/frame count mismatch")
@@ -251,7 +338,7 @@ class DatasetRecordWriter:
                 raise ValueError(f"{key}: image buffer/frame count mismatch")
             for index, path in enumerate(paths):
                 with Image.open(path) as image:
-                    image.load()  # decode all pixels; existence/header alone is insufficient
+                    image.load()  # 存在やヘッダーだけでなく、全画素を読み出せるか確認する。
                     if (
                         image.format != "PNG" or image.mode != "RGB"
                         or (image.height, image.width, 3) != tuple(spec["shape"])
@@ -259,13 +346,14 @@ class DatasetRecordWriter:
                         raise ValueError(f"{key}: invalid saved RGB image at frame {index}")
 
     def save_episode(self) -> None:
-        """Explicitly commit an episode after the entire run succeeded.
+        """エピソード全体が成功した後に、明示的に保存する。
 
-        In particular, do NOT call this when SafeRecordLoop.state == FAULT.
-        First wait for and validate every backing RGB PNG (native LeRobot).
-        Image validation failure latches FAULT before commit; explicit abort is
-        still possible. Once underlying save is attempted, failure may leave
-        partial files/metadata. No automatic rollback is attempted.
+        SafeRecordLoop.state が FAULT のときには呼ばないこと。
+        実際の LeRobot を使う場合は、先に全 RGB PNG の書き込みと内容を確認する。
+        画像内容の検査で失敗しただけなら、保存前なので明示的な中断は可能。
+        ただし、画像保存処理の異常などで使用禁止になっていれば中断も禁止する。
+        LeRobot の保存を一度でも試みた後の失敗では、ファイルや管理情報が一部残り得る。
+        自動で保存前の状態へ戻す処理は行わない。
         """
         if self.state is not WriterState.READY:
             raise DatasetWriterStateError(f"Cannot save from {self.state.value}")
@@ -274,6 +362,7 @@ class DatasetRecordWriter:
         stage = "validate_pending_images"
         commit_attempted = False
         try:
+            self._check_image_worker()
             self._validate_pending_images()
             stage = "save_episode"
             commit_attempted = True
@@ -285,36 +374,40 @@ class DatasetRecordWriter:
             raise
 
     def abort_episode(self) -> None:
-        """Discard UNSAVED episode buffers after a fault; never resume writer.
+        """未保存の一時データを捨てる。異常が起きた writer は再利用しない。
 
-        Must be called by the supervising application after independently
-        managing robot state. If native dataset.save_episode() failed, rollback is unknown
-        and user must quarantine dataset instead.
+        呼び出し側でロボットの状態に別途対処してから呼ぶこと。
+        LeRobot の dataset.save_episode() が失敗した場合は、元に戻せるか不明なので、
+        この方法で片付けずデータセットを使用禁止にする。
+        画像保存や後片付けが完了したか不明な場合も、保存をまだ試みていなくても
+        後片付けの再試行は禁止する。
         """
         if self.state in (WriterState.ABORTED, WriterState.FINALIZED):
             raise DatasetWriterStateError(f"Cannot abort from {self.state.value}")
-        if self.commit_uncertain:
-            raise DatasetWriterStateError("save_episode may have partially committed: quarantine dataset")
+        if self.quarantine_required:
+            raise DatasetWriterStateError("Commit/cleanup may be incomplete: quarantine dataset")
         try:
+            self._check_image_worker(wait=True)
             self.dataset.clear_episode_buffer(delete_images=True)
             self.frames_in_episode = 0
             self._staged = None
             self.state = WriterState.ABORTED
         except BaseException as exc:
-            self._fault("clear_episode_buffer", exc)
+            self._fault("clear_episode_buffer", exc, uncertain_cleanup=True)
             raise
 
     def finalize(self) -> None:
-        """Close writer only after successful save or explicit buffer abort.
+        """保存成功または明示的な一時データの破棄の後に、保存処理を閉じる。
 
-        Does not disconnect SO-101 and does not clear an unfinished episode.
-        Also not a substitute for an exception-safe hardware shutdown plan.
+        SO-101 の切断や、未完了エピソードの破棄は行わない。
+        実機の異常時に安全に終了するための手順は、別途用意する必要がある。
         """
         if self.state not in (WriterState.READY, WriterState.ABORTED):
             raise DatasetWriterStateError(f"Cannot finalize from {self.state.value}")
-        if self.frames_in_episode or self._staged is not None or self.commit_uncertain:
+        if self.frames_in_episode or self._staged is not None or self.quarantine_required:
             raise DatasetWriterStateError("Uncommitted frames/pending observation or uncertain commit")
         try:
+            self._check_image_worker(wait=True)
             self.dataset.finalize()
             self.state = WriterState.FINALIZED
         except BaseException as exc:
