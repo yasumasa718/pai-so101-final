@@ -142,6 +142,27 @@ def test_close_failure_preserves_original_fault(monkeypatch, tmp_path):
     ]
 
 
+def test_joint_range_failure_logs_reason_and_stops_without_retry(monkeypatch, tmp_path):
+    bus = ReadOnlyBus()
+    original_read = bus.sync_read
+
+    def out_of_range(*args, **kwargs):
+        values = original_read(*args, **kwargs)
+        values["wrist_flex"] = -120.0
+        return values
+
+    bus.sync_read = out_of_range
+    code, events = run_hardware_fake(monkeypatch, tmp_path, bus)
+    assert code == 1
+    fault = next(event for event in events if event["event"] == "fault")
+    assert fault["stage"] == "joint_read"
+    assert "wrist_flex.pos: -120.0000 outside configured interval" in fault["reason"]
+    assert "[-102.8571, 102.8571] degree" in fault["reason"]
+    assert bus.calls.count("positions") == 1
+    assert bus.calls[-1] == "close_without_torque_change"
+    assert not any(event["event"] == "complete" for event in events)
+
+
 def test_hash_failure_never_constructs_bus(monkeypatch, tmp_path):
     monkeypatch.setattr(diagnostic, "make_hardware_bus", lambda *args: pytest.fail("must not construct bus"))
     args = hardware_args(tmp_path)

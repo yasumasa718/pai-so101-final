@@ -40,6 +40,14 @@ def finite_time(value: object) -> float:
     return float(value)
 
 
+class JointReadError(ValueError):
+    """読取り側の検査で生成した理由。通信ライブラリの例外本文とは区別する。"""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.details = {"reason": reason}
+
+
 class TimedJointReader:
     """再試行なしで読み、欠損・範囲違反・時間異常を保持して以後の読取りを拒否する。
 
@@ -71,16 +79,16 @@ class TimedJointReader:
             if self._previous is not None and (
                 start <= self._previous.read_started_at or start < self._previous.read_completed_at
             ):
-                raise ValueError("Read clock moved backwards or was reused")
+                raise JointReadError("Read clock moved backwards or was reused")
             raw = self.bus.sync_read("Present_Position", normalize=True, num_retry=0)
             end = finite_time(self.clock())
             if not 0 <= end - start <= self.max_read_duration_s:
-                raise ValueError("Joint read duration exceeded limit or clock moved backwards")
+                raise JointReadError("Joint read duration exceeded limit or clock moved backwards")
             if not isinstance(raw, Mapping) or set(raw) != set(MOTOR_IDS):
-                raise ValueError("Expected exactly six motor observations")
+                raise JointReadError("Expected exactly six motor observations")
             checked = self.guard.check({f"{key}.pos": value for key, value in raw.items()})
             if not checked.accepted:
-                raise ValueError("Invalid joint observation: " + "; ".join(checked.reasons))
+                raise JointReadError("Invalid joint observation: " + "; ".join(checked.reasons))
             result = TimedJointObservation(tuple(checked.checked_action.items()), start, end)
             self._previous = result
             return result

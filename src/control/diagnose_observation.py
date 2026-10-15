@@ -1,4 +1,4 @@
-"""SO-101 の関節読取り診断。既定は模擬データ。位置指令・設定書込みはしない。
+"""SO-101 の関節・画像診断。既定は模擬データ。位置指令・モーター設定書込みはしない。
 
 実機モードは専用の子プロセスでバスを開き、校正レジスタ等を照合する。
 通常の SOFollower.connect/configure/disconnect は使わない。
@@ -10,16 +10,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
 from importlib.metadata import version
 from pathlib import Path
+from statistics import mean
 from typing import TextIO
 
 from src.control.action_guard import ActionGuard, MOTOR_IDS
+from src.control.diagnostic_camera import CameraDiagnosticError, DiagnosticCamera
 from src.control.record_startup_check import CALIBRATION_FIELDS
-from src.control.timed_observation import TimedJointReader, finite_time
+from src.control.timed_observation import JointReadError, TimedJointReader, finite_time
 
 
 def emit(stream: TextIO, event: str, **fields: object) -> None:
@@ -100,29 +103,71 @@ def verify_registers(bus, calibration: dict) -> dict:
     return result
 
 
-def collect_samples(reader: TimedJointReader, *, samples: int, period_s: float, stream: TextIO) -> None:
+def image_directory(output: Path) -> Path:
+    return output.with_name(output.stem + "_images")
+
+
+def make_camera(args: argparse.Namespace) -> DiagnosticCamera:
+    return DiagnosticCamera(
+        device=args.camera, image_dir=image_directory(args.output), width=args.camera_width,
+        height=args.camera_height, fps=args.camera_fps, focus=args.camera_focus,
+        warmup_frames=args.camera_warmup_frames, max_read_s=args.max_camera_read_s,
+        fake=args.backend == "fake",
+    )
+
+
+def collect_samples(
+    reader: TimedJointReader, *, samples: int, period_s: float, stream: TextIO,
+    camera: DiagnosticCamera | None = None,
+) -> None:
     previous_start = None
+    measurements = {key: [] for key in ("joint_read_s", "image_read_s", "joint_to_image_gap_s", "start_interval_s")}
     for index in range(samples):
         sample = reader.read()
+        interval = None if previous_start is None else sample.read_started_at - previous_start
+        extra = {}
+        if camera is not None:
+            image = camera.capture(index)
+            gap = image["read_started_at"] - sample.read_completed_at
+            if gap < 0:
+                raise ValueError("Image read predates joint read completion")
+            extra = {
+                "image": image, "joint_to_image_gap_s": gap,
+                "joint_start_to_image_end_s": image["read_completed_at"] - sample.read_started_at,
+                "sensor_sync_verified": False,
+            }
+            measurements["joint_read_s"].append(sample.read_duration_s)
+            measurements["image_read_s"].append(image["read_duration_s"])
+            measurements["joint_to_image_gap_s"].append(gap)
+            if interval is not None:
+                measurements["start_interval_s"].append(interval)
         emit(
             stream, "observation", index=index, positions=sample.as_observation(),
             read_started_at=sample.read_started_at, read_completed_at=sample.read_completed_at,
             read_duration_s=sample.read_duration_s,
-            start_interval_s=None if previous_start is None else sample.read_started_at - previous_start,
+            start_interval_s=interval,
             timestamp_source="host_monotonic_sync_read_interval",
+            **extra,
         )
         previous_start = sample.read_started_at
         if index + 1 < samples:
             # 遅れた場合は追いつくための連続読取りをせず、次の周期を測る。
             time.sleep(max(0.0, period_s - (time.monotonic() - sample.read_started_at)))
+    if camera is not None:
+        emit(stream, "summary", samples=samples, images_saved=samples,
+             timing_s={key: {"min": min(values), "mean": mean(values), "max": max(values)}
+                       for key, values in measurements.items() if values},
+             sensor_sync_verified=False)
 
 
 def run_worker(args: argparse.Namespace, stream: TextIO) -> int:
     bus = None
+    camera = None
     stage = "calibration"
     failed = False
     emit(stream, "start", backend=args.backend, samples=args.samples, period_s=args.period_s,
-         max_read_s=args.max_read_s, timeout_s=args.timeout_s, motor_writes=False)
+         max_read_s=args.max_read_s, timeout_s=args.timeout_s, motor_writes=False,
+         camera_enabled=args.camera is not None)
     try:
         if args.backend == "hardware":
             calibration, guard = load_calibration(Path(args.calibration), args.expected_sha256)
@@ -147,24 +192,42 @@ def run_worker(args: argparse.Namespace, stream: TextIO) -> int:
             } for name, motor_id in MOTOR_IDS.items()}).encode()
             guard = ActionGuard.from_calibration_bytes(payload)
             bus = FakeBus()
+        if args.camera is not None:
+            stage = "camera_open"
+            emit(stream, "stage", stage=stage)
+            camera = make_camera(args)
+            settings = camera.open()
+            emit(stream, "camera_config", image_directory=image_directory(args.output).name, **settings)
         stage = "joint_read"
         emit(stream, "stage", stage=stage)
         reader = TimedJointReader(bus, guard, max_read_duration_s=args.max_read_s)
-        collect_samples(reader, samples=args.samples, period_s=args.period_s, stream=stream)
+        collect_samples(reader, samples=args.samples, period_s=args.period_s, stream=stream, camera=camera)
     except BaseException as exc:
         failed = True
-        # 例外本文にはポート・機器識別情報が入り得るため記録しない。
-        details = exc.details if isinstance(exc, RegisterMismatch) else {}
+        # 通信例外の本文は伏せ、検査側で生成した理由・照合値だけ記録する。
+        details = exc.details if isinstance(exc, (RegisterMismatch, JointReadError)) else {}
+        if isinstance(exc, CameraDiagnosticError):
+            stage = exc.stage
+            details = exc.details
         emit(stream, "fault", stage=stage, error_type=type(exc).__name__, **details)
     finally:
-        if args.backend == "hardware" and bus is not None and bus.is_connected:
-            try:
-                bus.disconnect(disable_torque=False)
-            except BaseException as exc:
-                failed = True
-                emit(stream, "fault", stage="bus_close", error_type=type(exc).__name__)
+        try:
+            if camera is not None:
+                try:
+                    camera.close()
+                except BaseException as exc:
+                    failed = True
+                    emit(stream, "fault", stage="camera_close", error_type=type(exc).__name__)
+        finally:
+            if args.backend == "hardware" and bus is not None and bus.is_connected:
+                try:
+                    bus.disconnect(disable_torque=False)
+                except BaseException as exc:
+                    failed = True
+                    emit(stream, "fault", stage="bus_close", error_type=type(exc).__name__)
     if not failed:
-        emit(stream, "complete", samples=args.samples, motion_authorized=False)
+        details = {} if camera is None else {"images_saved": args.samples, "sensor_sync_verified": False}
+        emit(stream, "complete", samples=args.samples, motion_authorized=False, **details)
     return 1 if failed else 0
 
 
@@ -185,9 +248,9 @@ def stop_worker(process: subprocess.Popen) -> bool:
     return process.poll() is not None
 
 
-def supervise(command: list[str], stream: TextIO, timeout_s: float) -> int:
+def supervise(command: list[str], stream: TextIO, timeout_s: float, *, stderr=subprocess.DEVNULL) -> int:
     """子のログを保存し、完了待ち上限・割込み・異常終了を明示する。再起動しない。"""
-    process = subprocess.Popen(command, stdout=stream, stderr=subprocess.DEVNULL, start_new_session=True)
+    process = subprocess.Popen(command, stdout=stream, stderr=stderr, start_new_session=True)
     try:
         code = process.wait(timeout=timeout_s)
     except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
@@ -217,6 +280,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--port", help="Explicit /dev/serial/by-id/... Follower path")
     result.add_argument("--calibration", help="Reviewed Follower snapshot")
     result.add_argument("--expected-sha256", help="Previously reviewed fixed SHA-256")
+    result.add_argument("--camera", help="Optional /dev/videoN in hardware mode, or fake in fake mode")
+    result.add_argument("--camera-focus", type=int, help="Required with --camera; manual focus 0..1023")
+    result.add_argument("--camera-width", type=int, default=640)
+    result.add_argument("--camera-height", type=int, default=480)
+    result.add_argument("--camera-fps", type=float, default=30.0, help="Requested camera FPS; not measured FPS")
+    result.add_argument("--camera-warmup-frames", type=int, default=60)
+    result.add_argument("--max-camera-read-s", type=float, default=1.0, help="Post-return camera read limit")
     result.add_argument("--_worker", action="store_true", help=argparse.SUPPRESS)
     return result
 
@@ -228,9 +298,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.samples <= 0:
             raise ValueError("samples must be positive")
-        for value in (args.period_s, args.max_read_s, args.timeout_s):
+        for value in (args.period_s, args.max_read_s, args.timeout_s, args.camera_fps, args.max_camera_read_s):
             if finite_time(value) <= 0:
                 raise ValueError("Time limits and period must be positive")
+        if min(args.camera_width, args.camera_height) <= 0 or args.camera_warmup_frames < 0:
+            raise ValueError("Camera dimensions must be positive and warmup frames nonnegative")
+        if args.camera is not None:
+            if args.camera_focus is None or not 0 <= args.camera_focus <= 1023:
+                raise ValueError("Camera requires an explicit manual focus in 0..1023")
+            if args.backend == "fake" and args.camera != "fake":
+                raise ValueError("Fake mode only accepts --camera fake; never opens a video device")
+            if args.backend == "hardware" and re.fullmatch(r"/dev/video[0-9]+", args.camera) is None:
+                raise ValueError("Hardware camera must be an explicit /dev/videoN device")
+        elif args.camera_focus is not None:
+            raise ValueError("Camera focus requires --camera")
         if args.backend == "hardware":
             if not args.port or Path(args.port).parent != Path("/dev/serial/by-id"):
                 raise ValueError("Hardware mode requires an explicit /dev/serial/by-id/... port")
@@ -246,6 +327,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_worker(args, sys.stdout)
     try:
         with args.output.open("x", encoding="utf-8") as stream:
+            if args.camera is not None:
+                image_directory(args.output).mkdir()  # 既存ディレクトリやsymlinkを再利用しない。
             code = supervise(
                 [sys.executable, "-m", "src.control.diagnose_observation", *arguments, "--_worker"],
                 stream, args.timeout_s,
