@@ -189,6 +189,7 @@ class SafeRecordSession:
         *,
         dataset_observation: Mapping[str, Any] | None = None,
         observation_time: float | None = None,
+        observation_end_time: float | None = None,
     ) -> RecordedFrameResult:
         """観測を預け、検査した指令を 1 回送信し、返された指令値を一時保存する。
 
@@ -198,6 +199,7 @@ class SafeRecordSession:
 
         loop.motion_guard を使う場合、observation_time に関節観測の取得時刻を渡す。
         この時刻には loop.clock と同じ単調時計を使う。
+        読取り区間の場合は開始を observation_time、終了を observation_end_time に渡す。
         時刻は検査用として別に渡し、データセットの特徴量の辞書には追加しない。
         """
         self._require(SessionState.RECORDING)
@@ -207,7 +209,10 @@ class SafeRecordSession:
             to_record = observation if dataset_observation is None else dataset_observation
             self.writer.stage_observation(to_record)  # 送信より先に、観測の準備が成功している必要がある。
             stage = "process_frame"
-            result = self.loop.process_frame(raw_action, observation, observation_time=observation_time)
+            result = self.loop.process_frame(
+                raw_action, observation, observation_time=observation_time,
+                observation_end_time=observation_end_time,
+            )
             completed_send = True
             stage = "post_frame_consistency"
             if (

@@ -5,7 +5,8 @@
 モーターがその通りに動くことを保証するものでもない。
 
 観測の取得と収録ループには、同じ単調時計（時刻合わせで戻らない時計）を使う。
-観測時刻には、関節の値を実際に取得した時刻を渡す。
+観測時刻には、関節の取得時刻または同期読取りの開始・終了区間を渡す。
+ホストで計測した区間は、センサー内部の測定時刻や同時性を保証しない。
 通常の日時、FPS から作ったデータセット時刻、データが届いた時刻で代用しない。
 正しい取得時刻を渡す責任は呼び出し側にある。
 指令の履歴は各 SafeRecordLoop が持つ。この検査設定自体は変更せず共有できる。
@@ -55,6 +56,7 @@ class MotionCheck:
     observed_at: float
     interval_s: float
     observation_age_s: float
+    observation_completed_at: float
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -105,6 +107,7 @@ class MotionGuard:
         *,
         observed_at: object,
         now: object,
+        observation_end_time: object | None = None,
         previous_action: Mapping[str, object] | None = None,
         previous_sent_at: float | None = None,
         previous_observed_at: float | None = None,
@@ -116,9 +119,16 @@ class MotionGuard:
         前回の戻り時刻から今回の検査までの時間を使う。
         時間が空きすぎた場合は拒否し、その分だけ大きな変化を許すことはしない。
         2 回目以降の観測は前回より新しく、前回の送信処理が戻った時刻以降のものが必要。
+        区間を渡す場合、鮮度は observed_at（開始）、初回の速度は
+        observation_end_time（終了）から評価する。終了省略時は従来の単一時刻。
         """
         checked_at = _number(now, "monotonic clock")
         capture_time = _number(observed_at, "observation_time")
+        capture_end = capture_time if observation_end_time is None else _number(
+            observation_end_time, "observation_end_time",
+        )
+        if not capture_time <= capture_end <= checked_at:
+            raise MotionRejectedError("Invalid observation acquisition interval")
         age = checked_at - capture_time
         if not 0 <= age <= self.max_observation_age_s:
             raise MotionRejectedError("Observation is stale or its timestamp is in the future")
@@ -126,7 +136,9 @@ class MotionGuard:
         if previous_action is None:
             if previous_sent_at is not None or previous_observed_at is not None:
                 raise MotionRejectedError("Incomplete motion history")
-            reference, reference_time, source = measured, capture_time, "observation"
+            # 鮮度は最も古い時刻、初回の速度許容量は最も新しい時刻で評価する。
+            # 読取りの待機時間を、目標値を変化させてよい時間に含めない。
+            reference, reference_time, source = measured, capture_end, "observation"
         else:
             reference = self._positions(previous_action, "previous returned target")
             reference_time = _number(previous_sent_at, "previous send return time")
@@ -137,7 +149,7 @@ class MotionGuard:
         interval = checked_at - reference_time
         if not self.min_interval_s <= interval <= self.max_interval_s:
             raise MotionRejectedError("Send interval is too short, too long or clock moved backwards")
-        result = MotionCheck(tuple(reference.items()), source, checked_at, capture_time, interval, age)
+        result = MotionCheck(tuple(reference.items()), source, checked_at, capture_time, interval, age, capture_end)
         self.validate_target(candidate, result)
         return result
 

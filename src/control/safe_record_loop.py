@@ -156,6 +156,7 @@ class SafeRecordLoop:
         observation: Mapping[str, Any],
         *,
         observation_time: float | None = None,
+        observation_end_time: float | None = None,
     ) -> RecordedFrameResult:
         """1 フレームを処理する。異常時は FAULT を保持し、RecordFault を発生させる。
 
@@ -165,6 +166,7 @@ class SafeRecordLoop:
         このメソッドではトルク解除や切断は行わない。
         observation_time は関節の値を実際に取得した時刻であり、通常の日時や
         データセットが生成する時刻ではない。motion_guard を使う場合は必須。
+        読取り区間を使う場合は observation_time に開始、observation_end_time に終了を渡す。
         """
         if self.state is not RecordState.RECORDING:
             raise RecordStateError(f"Cannot process frame from {self.state.value}")
@@ -201,6 +203,7 @@ class SafeRecordLoop:
                 assert measured is not None
                 motion_check = self.motion_guard.check(
                     to_send, measured, observed_at=observation_time, now=self.clock(),
+                    observation_end_time=observation_end_time,
                     previous_action=self._previous_sent_action,
                     previous_sent_at=self._previous_sent_at,
                     previous_observed_at=self._previous_observed_at,
