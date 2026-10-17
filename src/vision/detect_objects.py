@@ -40,31 +40,21 @@ def load_detector():
     )
 
 
-def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--image", type=Path, default=INPUT_PATH, help="入力画像")
-    parser.add_argument("--output-dir", type=Path, help="保存先（省略時は日時付きフォルダー）")
-    parser.add_argument("--roi", type=ROI.from_csv, help="xmin,ymin,xmax,ymax（画像座標）")
-    parser.add_argument("--min-score", type=float, default=THRESHOLD, help="検出・ROI判定の共通閾値（既定: 0.1）")
-    args = parser.parse_args(argv)
-    if not 0 <= args.min_score <= 1:
-        parser.error("--min-score must be between 0 and 1")
-
-    with Image.open(args.image) as source:
+def detect_image(image_path, output_dir, roi=None, min_score=THRESHOLD, *, detector=None):
+    """モデルを渡せば読み込みを再利用できる。画像認識・保存だけを行い、判定を返す。"""
+    with Image.open(image_path) as source:
         image = source.convert("RGB")
-    if args.roi is not None:
-        args.roi.validate(*image.size)
-    output_dir = args.output_dir or (
-        ROOT / "outputs" / f"owlv2_check_{datetime.now():%Y%m%d_%H%M%S_%f}"
-    )
+    if roi is not None:
+        roi.validate(*image.size)
     output_dir.mkdir(parents=True, exist_ok=True)
-    detector = load_detector()
+    if detector is None:
+        detector = load_detector()
 
     # AI推論
     results = detector(
         image,
         candidate_labels=TARGETS,
-        threshold=args.min_score,
+        threshold=min_score,
     )
 
     print("Detection count:", len(results))
@@ -115,19 +105,19 @@ def main(argv=None) -> int:
     if not detections:
         print("No objects detected above threshold.")
 
-    if args.roi is not None:
+    report = None
+    if roi is not None:
         report = validate_detections(
             detections, image_width=image.width, image_height=image.height,
-            roi=args.roi, min_score=args.min_score,
+            roi=roi, min_score=min_score,
         )
         report_path = output_dir / "detection_gate.json"
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
                                encoding="utf-8")
-        draw.rectangle((args.roi.xmin, args.roi.ymin, args.roi.xmax, args.roi.ymax), outline="yellow", width=2)
+        draw.rectangle((roi.xmin, roi.ymin, roi.xmax, roi.ymax), outline="yellow", width=2)
         print("ROI candidates:", report["roi_candidates"])
         print("Recognition gate:", report["recognition_gate"])
         print("Report saved:", report_path.resolve())
-    print("Robot execution allowed: NO")
 
     # 検出画像の保存
     image.save(output_dir / "detected.jpg")
@@ -145,6 +135,21 @@ def main(argv=None) -> int:
 
     print("Saved:", (output_dir / "detected.jpg").resolve())
     print("Saved:", (output_dir / "detections.json").resolve())
+    return report
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--image", type=Path, default=INPUT_PATH, help="入力画像")
+    parser.add_argument("--output-dir", type=Path, help="保存先（省略時は日時付きフォルダー）")
+    parser.add_argument("--roi", type=ROI.from_csv, help="xmin,ymin,xmax,ymax（画像座標）")
+    parser.add_argument("--min-score", type=float, default=THRESHOLD, help="検出・ROI判定の共通閾値（既定: 0.1）")
+    args = parser.parse_args(argv)
+    if not 0 <= args.min_score <= 1:
+        parser.error("--min-score must be between 0 and 1")
+    output = args.output_dir or ROOT / "outputs" / f"owlv2_check_{datetime.now():%Y%m%d_%H%M%S_%f}"
+    detect_image(args.image, output, args.roi, args.min_score)
+    print("Robot execution allowed: NO")
     return 0
 
 

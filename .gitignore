@@ -30,6 +30,7 @@ outputs/
 checkpoints/
 runs/
 wandb/
+docs/
 *.pt
 *.pth
 *.ckpt
