@@ -47,6 +47,12 @@ docs/
 # Logs
 *.log
 
+# Local source backups and historical calibration snapshots
+*.bak
+/configs/calibration_snapshots/*
+!/configs/calibration_snapshots/my_follower_for_004.json
+!/configs/calibration_snapshots/my_leader_for_004.json
+
 # OS / Editor
 .DS_Store
 .vscode/

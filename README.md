@@ -64,6 +64,8 @@ AIは物体の検出と動作を開始するための候補判定に使用して
 | 統合結果 | `replay_completed=true`、終了コード0 | 同左 |
 | 実物の動作 | 操作者が補助なしの把持・投入・退避成功、滑り・動作中の机や箱への接触なしを報告 | 動画の抽出フレームで把持・持上げ・投入・退避を確認 |
 
+デモ動画撮影時の[実行ログ](examples/final_demo/demo_20261017_163349/events.jsonl)と[認識結果](examples/final_demo/demo_20261017_163349/recognition/detection_gate.json)を公開用フォルダーに収録しています。表の保存先は実行当時のパスです。初回統合試行のログはローカル保存のみです。
+
 送信ログには到達待ちなどの追加指令が含まれます。「関節観測区間」は最初と最後の送信フレームに記録した読取り開始時刻の差で、モデル読込みを含む全実行時間や動画の長さではありません。2ログの正常終了を、試行全体の成功率として扱ってはいません。
 
 ### デモ動画で確認した内容
@@ -99,6 +101,8 @@ AIは物体の検出と動作を開始するための候補判定に使用して
 
 LeRobotDatasetの保存・隔離などの補助実装もリポジトリに残していますが、提出デモの実行経路には使用していません。
 
+校正ファイルは、実行・テストで使用する`configs/calibration_snapshots/my_follower_for_004.json`と`my_leader_for_004.json`の2件を掲載しています。過去の校正スナップショットとソースのバックアップは公開対象から外し、ローカルの`outputs/submission_excluded/`に保管しています。補助実装とそのテストは、実装・検証内容を確認できるよう掲載しています。
+
 ## 実行環境
 
 | 項目 | 確認済み環境 |
@@ -130,24 +134,25 @@ OWLv2の初回実行ではモデルの取得が必要です。カメラ操作に
 
 | 入力 | パス |
 | --- | --- |
-| 手本ログ | `outputs/stationary_can_20261017_155438.jsonl` |
-| 要所の姿勢候補 | `outputs/motion_review_stationary_can_20261017_155438/selected_poses.json` |
-| Follower校正 | `configs/calibration_snapshots/my_follower_for_004.json` |
+| 手本ログ | [stationary_can_20261017_155438.jsonl](examples/final_demo/stationary_can_20261017_155438.jsonl) |
+| 要所の姿勢候補 | [selected_poses.json](examples/final_demo/selected_poses.json) |
+| Follower校正 | [my_follower_for_004.json](examples/final_demo/calibration/my_follower_for_004.json) |
 | 校正SHA-256 | `820904e1ad9fe22bd4d3a50bcc1e25eb7e76c49b070ee44fd7eca4ad7e76f1d8` |
 
-**`outputs/`はGit管理対象外です。** 動画・実行ログ・手本・姿勢候補はローカル成果物のため、リポジトリをcloneしただけでは実機再生の入力は揃いません。同じ実行を再現するには対応する入力ファイルが必要です。自分の機体で手本を作る場合は`guarded_teleop.py`と`review_teleop.py`を使用します。
+**採点・閲覧用のデータを[examples/final_demo/](examples/final_demo/)にまとめています。** 手本・姿勢候補・Follower校正と、デモ1回分の実行ログ・認識結果・画像を収録しています。[確認手順](examples/final_demo/README.md)では、実機やAIモデルを使わずに保存データを検査できます。`outputs/`は引き続きGit管理対象外で、元の実験記録・動画と新規実行の出力先として使用します。自分の機体で手本を作る場合は`guarded_teleop.py`と`review_teleop.py`を使用します。
 
 ### 1. 開始姿勢を合わせる（読取りのみ）
 
 WSLでリポジトリのルートを開き、`FOLLOWER_PORT`を実機のFollowerのby-idパスへ置き換えます。缶を一時的に外し、トルクOFFのアームの重さを手や支えで受けながら合わせます。
 
 ```bash
+mkdir -p outputs
 FOLLOWER_PORT='/dev/serial/by-id/<Followerのby-id名>'
 
 .venv/bin/python -m src.control.guarded_replay \
-  --source-log outputs/stationary_can_20261017_155438.jsonl \
-  --checkpoints outputs/motion_review_stationary_can_20261017_155438/selected_poses.json \
-  --calibration configs/calibration_snapshots/my_follower_for_004.json \
+  --source-log examples/final_demo/stationary_can_20261017_155438.jsonl \
+  --checkpoints examples/final_demo/selected_poses.json \
+  --calibration examples/final_demo/calibration/my_follower_for_004.json \
   --expected-sha256 820904e1ad9fe22bd4d3a50bcc1e25eb7e76c49b070ee44fd7eca4ad7e76f1d8 \
   --port "$FOLLOWER_PORT" \
   --watch-start \
@@ -162,9 +167,9 @@ FOLLOWER_PORT='/dev/serial/by-id/<Followerのby-id名>'
 
 ```bash
 .venv/bin/python -m src.control.recognize_and_replay \
-  --source-log outputs/stationary_can_20261017_155438.jsonl \
-  --checkpoints outputs/motion_review_stationary_can_20261017_155438/selected_poses.json \
-  --calibration configs/calibration_snapshots/my_follower_for_004.json \
+  --source-log examples/final_demo/stationary_can_20261017_155438.jsonl \
+  --checkpoints examples/final_demo/selected_poses.json \
+  --calibration examples/final_demo/calibration/my_follower_for_004.json \
   --expected-sha256 820904e1ad9fe22bd4d3a50bcc1e25eb7e76c49b070ee44fd7eca4ad7e76f1d8 \
   --port "$FOLLOWER_PORT" \
   --camera /dev/video0 \

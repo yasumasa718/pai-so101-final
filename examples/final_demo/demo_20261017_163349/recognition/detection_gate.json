@@ -1,0 +1,41 @@
+{
+  "schema_version": "1.0",
+  "recognition_gate": "PASS",
+  "reason": "Exactly one detection matched the image-space criteria",
+  "detections_total": 1,
+  "roi_candidates": 1,
+  "roi": {
+    "xmin": 260,
+    "ymin": 210,
+    "xmax": 350,
+    "ymax": 350
+  },
+  "roi_rule": "bounding_box_center_inside",
+  "min_score": 0.1,
+  "target_label": "a soda can",
+  "image_size": {
+    "width": 640,
+    "height": 480
+  },
+  "candidates": [
+    {
+      "detection_index": 0,
+      "label": "a soda can",
+      "score": 0.7085893154144287,
+      "box": {
+        "xmin": 251.0,
+        "ymin": 197.0,
+        "xmax": 319.0,
+        "ymax": 312.0
+      },
+      "center": {
+        "x": 285.0,
+        "y": 254.5
+      },
+      "full_box_inside_roi": false
+    }
+  ],
+  "manual_visual_review_required": true,
+  "robot_execution_allowed": false,
+  "note": "Recognition only; not a robot workspace, grasp pose, or collision-safety check. Box center inside ROI does not require full box containment."
+}
