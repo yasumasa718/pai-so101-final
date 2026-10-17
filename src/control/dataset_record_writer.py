@@ -73,6 +73,8 @@ class DatasetLike(Protocol):
 
 
 class WriterState(str, Enum):
+    """1フレームごとにREADY→STAGED→READYと進み、異常時にはFAULTを保持する。"""
+
     READY = "ready"       # 観測を受け付けられる状態。未保存のフレームがある場合もある。
     STAGED = "staged"     # 観測を一つ預かり、送信後の指令値を待っている状態。
     FAULT = "fault"       # 観測の準備や保存で失敗した状態。追加の書き込みは禁止。
@@ -132,6 +134,7 @@ class DatasetRecordWriter:
         if native_writer is not None and getattr(native_writer, "_streaming_encoder", None) is not None:
             raise ValueError("Streaming encoding is not supported by the guarded image-file validation")
         self._action_names = self._validate_joint_feature(features, "action")
+        # actionとobservation.stateの並びは同じとは限らない。各メタデータの順序を保持する。
         self._state_names = self._validate_joint_feature(features, "observation.state")
         # 対応している SO-101 の項目だけを受け付ける。必要な項目を記録し忘れないよう、
         # 未対応の項目が必要な形式なら、収録前にエラーにする。
@@ -365,6 +368,7 @@ class DatasetRecordWriter:
             self._check_image_worker()
             self._validate_pending_images()
             stage = "save_episode"
+            # 呼出し後の例外では部分保存を否定できないため、試行前にフラグを立てる。
             commit_attempted = True
             self.dataset.save_episode()
             self.saved_episodes += 1

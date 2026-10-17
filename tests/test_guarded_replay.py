@@ -1,4 +1,8 @@
-"""実機なしで全経路の再生、把持待機、起動拒否、停止時の全軸解除を確認する。"""
+"""固定経路の準備・周期再生・要所の到達待ち・異常時解除を実機なしで検証する。
+
+10フレームの手本と5要所を作り、時計とバスを差し替えて待機を再現する。
+送信目標と実測値に意図的な差を設け、両者を取り違えた実装が通らないようにする。
+"""
 
 import hashlib
 import io
@@ -19,6 +23,7 @@ SNAPSHOT = Path("configs/calibration_snapshots/my_follower_for_004.json")
 
 
 class ReplayBus(TeleopBus):
+    """送信に追従する模擬バスへ、腕の偏差・腕停止・爪の閉じ止まり・開けない状態を追加する。"""
     arm_bias = None
     freeze_arm = False
     blocked_close = False
@@ -26,6 +31,7 @@ class ReplayBus(TeleopBus):
     has_closed = False
 
     def sync_write(self, register, values, **kwargs):
+        """通常の目標適用後に観測値を変え、同じ指令でも機械の応答が異なる状況を模擬する。"""
         previous = dict(self.raw)
         super().sync_write(register, values, **kwargs)
         for motor, degrees in (self.arm_bias or {}).items():
@@ -46,12 +52,15 @@ class ReplayBus(TeleopBus):
 
 @pytest.fixture
 def setup(tmp_path, monkeypatch):
+    """10フレームの元ログ・5要所JSON・模擬バス・時計を作る。肩の指令と実測には7度の差を入れる。"""
     clock = Clock()
     monkeypatch.setattr(replay.time, "monotonic", clock)
     monkeypatch.setattr(replay.time, "sleep", clock.sleep)
     calibration = json.loads(SNAPSHOT.read_bytes())
     bus = ReplayBus(calibration, clock)
     bus.arm_bias = {"shoulder_lift": -7.0}  # 手本の指令と実測に残る一定の差を模擬。
+    # 目標へ即座に一致するだけの模擬バスでは、送信目標を到達参照へ誤用しても検出できない。
+    # 手本にも同じ7度差を入れ、通常ケースだけが実測の参照位置へ一致するようにする。
     initial_raw = {**bus.raw, "gripper": calibration["gripper"]["range_min"]
                    + round(0.35*(calibration["gripper"]["range_max"]-calibration["gripper"]["range_min"]))}
     bus.raw = dict(initial_raw)
@@ -82,12 +91,17 @@ def setup(tmp_path, monkeypatch):
 
 
 def run(args):
+    """再生の子側処理を直接実行し、終了コードとJSONLイベントを返す。"""
     stream = io.StringIO()
     code = replay.run_worker(args, stream)
     return code, records(stream.getvalue())
 
 
 def test_compiles_every_recorded_command_and_keeps_observation_as_arrival_reference(setup):
+    """全フレームの送信目標を順に再現し、実測値は到達参照として別に保持する計画を確認する。
+
+    大きな変化が分割され、各指令の範囲・変化量・速度が制限内であることも確かめる。
+    """
     args, bus, frames, _, _ = setup
     _, guard, plan = replay.prepare(args)
     finished = [s for s in plan["steps"] if s["source_frame_complete"]]
@@ -109,6 +123,7 @@ def test_compiles_every_recorded_command_and_keeps_observation_as_arrival_refere
 
 
 def test_default_preview_has_no_hardware_io_and_preserves_existing_output(setup, tmp_path):
+    """既定のプレビューは実機I/Oなしで計画を保存し、同名出力の上書きを拒否することを確認する。"""
     args, bus, _, _, _ = setup
     output = tmp_path / "preview.json"
     argv = ["--source-log", str(args.source_log), "--checkpoints", str(args.checkpoints),
@@ -124,6 +139,7 @@ def test_default_preview_has_no_hardware_io_and_preserves_existing_output(setup,
 
 @pytest.mark.parametrize("offset", [0, 15])
 def test_success_keeps_all_frames_prime_goal_and_turns_all_axes_off(setup, offset):
+    """許容内の開始ずれを含め、現在位置の保持から全フレーム・5要所を通過し、全軸OFFで終わることを確認する。"""
     args, bus, _, _, _ = setup
     bus.raw["shoulder_pan"] -= offset  # 開始許容幅内のずれも段階追従する。
     initial = dict(bus.raw)
@@ -147,6 +163,7 @@ def test_success_keeps_all_frames_prime_goal_and_turns_all_axes_off(setup, offse
 
 @pytest.mark.parametrize("execute", [False, True])
 def test_start_mismatch_never_sends_or_enables(setup, execute):
+    """開始姿勢が許容差外なら、確認専用・実行のどちらでも位置指令やトルク書込みをしないことを確認する。"""
     args, bus, _, _, _ = setup
     args.execute = execute
     bus.raw["shoulder_pan"] += 40
@@ -158,6 +175,7 @@ def test_start_mismatch_never_sends_or_enables(setup, execute):
 
 
 def test_check_start_only_reads(setup):
+    """開始姿勢の確認だけなら読取りと切断のみを行い、位置・トルクを書かないことを確認する。"""
     args, bus, _, _, _ = setup
     args.execute = False
     code, events = run(args)
@@ -167,6 +185,7 @@ def test_check_start_only_reads(setup):
 
 
 def test_changed_physical_response_does_not_pass_just_because_command_was_reached(setup):
+    """現在の実測が送信目標へ一致しても、手本の実測位置と違えば到達待ちが時間切れになることを確認する。"""
     args, bus, _, _, _ = setup
     bus.arm_bias = None  # 手本では指令より7度小さかった実測が、今回は指令そのものに到達。
     code, events = run(args)
@@ -178,6 +197,7 @@ def test_changed_physical_response_does_not_pass_just_because_command_was_reache
 
 
 def test_watch_start_continues_through_mismatch_and_exits_on_stable_match(setup, capsys):
+    """手動調整用表示が不一致から観測を続け、3回連続の一致で終了し、書込みを行わないことを確認する。"""
     args, bus, _, _, _ = setup
     args.execute, args.watch_start, args.watch_duration_s = False, True, 10
     bus.raw["shoulder_pan"] -= 30
@@ -195,6 +215,7 @@ def test_watch_start_continues_through_mismatch_and_exits_on_stable_match(setup,
 
 
 def test_watch_start_duration_ends_without_false_match_or_writes(setup, capsys):
+    """姿勢が合わずに表示期限へ達した場合、正常な表示終了と姿勢一致を区別して記録することを確認する。"""
     args, bus, _, _, clock = setup
     args.execute, args.watch_start, args.watch_duration_s = False, True, 2
     bus.raw["shoulder_lift"] += 300
@@ -207,6 +228,7 @@ def test_watch_start_duration_ends_without_false_match_or_writes(setup, capsys):
 
 
 def test_watch_start_read_failure_stops_and_closes_without_writes(setup):
+    """姿勢表示中の読取り失敗で再試行せず切断し、書込みを行わないことを確認する。"""
     args, bus, _, _, _ = setup
     args.execute, args.watch_start, args.watch_duration_s = False, True, 10
     bus.fail_read_at = 2
@@ -218,6 +240,7 @@ def test_watch_start_read_failure_stops_and_closes_without_writes(setup):
 
 
 def test_watch_start_and_execute_cannot_be_combined(setup):
+    """姿勢表示と実行の同時指定を、接続前に引数エラーとして拒否することを確認する。"""
     args, bus, _, _, _ = setup
     with pytest.raises(SystemExit) as error:
         replay.main(["--source-log", str(args.source_log), "--checkpoints", str(args.checkpoints),
@@ -227,6 +250,7 @@ def test_watch_start_and_execute_cannot_be_combined(setup):
 
 
 def test_watch_parent_allows_display_duration_and_forwards_read_only_mode(setup, tmp_path, monkeypatch):
+    """親が読取り専用指定と120秒の表示時間を子へ渡し、余裕15秒を含む監視期限を設定することを確認する。"""
     args, bus, _, _, _ = setup
     def supervise(command, stream, timeout_s, **kwargs):
         assert "--watch-start" in command and "--execute" not in command
@@ -242,6 +266,7 @@ def test_watch_parent_allows_display_duration_and_forwards_read_only_mode(setup,
 
 
 def test_grasp_allows_blocked_closing_position_but_waits_and_checks_opening(setup):
+    """閉じ側の爪の未到達は把持・搬送中に許す一方、把持待機時間と解放時の開き到達は要求することを確認する。"""
     args, bus, _, _, _ = setup
     bus.blocked_close = True
     code, events = run(args)
@@ -261,6 +286,7 @@ def test_grasp_allows_blocked_closing_position_but_waits_and_checks_opening(setu
 @pytest.mark.parametrize("blocked,phase,last_frame", [("freeze_arm", "approach", 2),
                                                        ("blocked_open", "release", 8)])
 def test_arrival_timeout_stops_before_next_phase_and_releases(setup, blocked, phase, last_frame):
+    """腕停止または爪の開き不良で要所の待機を期限切れとし、次の工程へ進まず全軸解除することを確認する。"""
     args, bus, _, _, clock = setup
     setattr(bus, blocked, True)
     code, events = run(args)
@@ -275,6 +301,7 @@ def test_arrival_timeout_stops_before_next_phase_and_releases(setup, blocked, ph
 
 @pytest.mark.parametrize("fault", ["fail_send", "fail_read_at", "fail_enable", "interrupt"])
 def test_communication_and_interrupt_stop_without_retry_and_release(setup, monkeypatch, fault):
+    """送信・読取り・有効化・割込みの失敗後は経路を続けず、有効化を試みた全軸を解除することを確認する。"""
     args, bus, _, _, _ = setup
     if fault == "interrupt":
         original = bus.sync_read
@@ -299,6 +326,7 @@ def test_communication_and_interrupt_stop_without_retry_and_release(setup, monke
 
 
 def test_one_off_failure_does_not_skip_other_axes_or_claim_complete(setup):
+    """爪のOFF失敗があっても残り5軸の解除を試み、未確認軸を残して正常完了を報告しないことを確認する。"""
     args, bus, _, _, _ = setup
     bus.fail_off = "gripper"
     code, events = run(args)
@@ -312,6 +340,7 @@ def test_one_off_failure_does_not_skip_other_axes_or_claim_complete(setup):
 @pytest.mark.parametrize("damage", ["fault_source", "read_only_source", "unconfirmed_off",
                                     "range", "checkpoint", "input_changed", "calibration_hash"])
 def test_bad_input_is_rejected_before_hardware_connection(setup, damage):
+    """異常終了ログ・未実行ログ・解除未確認・範囲外・要所不一致・ハッシュ不一致を、接続前に拒否することを確認する。"""
     args, bus, _, rows, _ = setup
     if damage == "fault_source":
         rows.insert(-1, {"event": "fault"})
@@ -336,6 +365,7 @@ def test_bad_input_is_rejected_before_hardware_connection(setup, damage):
 
 
 def test_initial_torque_on_is_rejected_without_writing(setup):
+    """開始時に1軸でもトルクONなら、保持目標の送信やトルク操作へ進まないことを確認する。"""
     args, bus, _, _, _ = setup
     bus.torque["wrist_roll"] = 1
     code, events = run(args)
@@ -345,6 +375,7 @@ def test_initial_torque_on_is_rejected_without_writing(setup):
 
 
 def test_initial_goal_readback_failure_never_enables(setup, monkeypatch):
+    """保持目標の読戻し不一致を検出し、目標送信1回の後にトルクを有効化しないことを確認する。"""
     args, bus, _, _, _ = setup
     original = bus.read
     def read(register, motor, **kwargs):
@@ -358,6 +389,7 @@ def test_initial_goal_readback_failure_never_enables(setup, monkeypatch):
 
 @pytest.mark.parametrize("expire_during_readback", [False, True])
 def test_recognition_deadline_blocks_stale_motor_startup(setup, monkeypatch, expire_during_readback):
+    """既に期限切れの場合と保持目標の読戻し中に期限切れになる場合の双方で、トルクONを防ぐことを確認する。"""
     args, bus, _, _, clock = setup
     deadline = clock.now+10 if expire_during_readback else clock.now-1
     if expire_during_readback:
@@ -376,6 +408,7 @@ def test_recognition_deadline_blocks_stale_motor_startup(setup, monkeypatch, exp
 
 
 def test_slow_read_during_motion_sends_no_next_command(setup, monkeypatch):
+    """動作中の読取りを0.3秒遅らせ、起動時保持に続く目標を送らず全軸解除することを確認する。"""
     args, bus, _, _, clock = setup
     original = bus.sync_read
     def read(*a, **kwargs):
@@ -391,6 +424,7 @@ def test_slow_read_during_motion_sends_no_next_command(setup, monkeypatch):
 
 
 def test_parent_starts_supervised_worker_with_exact_input_hashes(setup, tmp_path, monkeypatch):
+    """親が入力ファイルのハッシュ・実行指定・期限を監視処理へ渡し、その終了コードを返すことを確認する。"""
     args, bus, _, _, _ = setup
     output = tmp_path / "hardware.jsonl"
     def supervise(command, stream, timeout_s, **kwargs):

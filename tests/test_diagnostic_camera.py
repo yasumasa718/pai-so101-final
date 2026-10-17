@@ -1,4 +1,8 @@
-"""OpenCVの符号化／読戻しは実物を使い、カメラとモーターI/Oは模擬する。"""
+"""カメラI/Oを模擬し、設定照合・画像の保存・異常時の解放を検証する。
+
+OpenCVのPNG符号化と読戻しは実物を使い、画素値・色順・フレーム対応を確認する。
+関節と画像の組取得ではモーターI/Oも模擬する。停止しない読取りの監視は実子プロセスで試す。
+"""
 
 import io
 import json
@@ -15,6 +19,7 @@ from test_diagnose_observation import ReadOnlyBus, hardware_args, records
 
 
 class FakeCapture:
+    """設定値・読取り回数・解放回数を記録し、設定拒否や異常画像を注入できるVideoCapture代役。"""
     def __init__(self):
         self.props = {}
         self.opens = []
@@ -43,6 +48,7 @@ class FakeCapture:
         return self.report_override.get(prop, self.props[prop])
 
     def read(self):
+        """BGRの青成分に読取り回数を入れ、保存後に色順とフレーム番号を判別できる画像を返す。"""
         self.read_count += 1
         if self.bad_read is not None:
             return self.bad_read
@@ -58,6 +64,7 @@ class FakeCapture:
 
 
 def camera_for(tmp_path, monkeypatch, capture=None, **kwargs):
+    """VideoCaptureを差し替え、64×48画像・1枚warmupの診断カメラと代役を返す。"""
     cap = capture if capture is not None else FakeCapture()
     monkeypatch.setattr(cv2, "VideoCapture", lambda: cap)
     directory = tmp_path / "images"
@@ -68,6 +75,7 @@ def camera_for(tmp_path, monkeypatch, capture=None, **kwargs):
 
 
 def test_configure_manual_focus_and_verify_real_png_roundtrip(tmp_path, monkeypatch):
+    """手動フォーカス等の設定、warmup、PNGの全画素とBGR順、読取り区間、解放を確認する。"""
     camera, cap = camera_for(tmp_path, monkeypatch)
     config = camera.open()
     assert cap.opens == [("/dev/video0", cv2.CAP_V4L2)]
@@ -87,6 +95,7 @@ def test_configure_manual_focus_and_verify_real_png_roundtrip(tmp_path, monkeypa
 
 
 def test_buffer_request_failure_does_not_claim_freshness(tmp_path, monkeypatch):
+    """バッファ縮小が拒否されてもその事実を残し、センサー時刻が利用できるとは報告しないことを確認する。"""
     cap = FakeCapture()
     cap.buffer_accepted = False
     camera, _ = camera_for(tmp_path, monkeypatch, cap)
@@ -101,6 +110,7 @@ def test_buffer_request_failure_does_not_claim_freshness(tmp_path, monkeypatch):
     (cv2.CAP_PROP_FPS, 15), (cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"YUYV")),
 ])
 def test_reported_settings_mismatch_rejected(tmp_path, monkeypatch, prop, value):
+    """フォーカス・AF・fps・形式の読戻し不一致で起動を拒否し、比較値を残して画像を保存しないことを確認する。"""
     cap = FakeCapture()
     cap.report_override[prop] = value
     camera, _ = camera_for(tmp_path, monkeypatch, cap)
@@ -116,6 +126,7 @@ def test_reported_settings_mismatch_rejected(tmp_path, monkeypatch, prop, value)
 
 @pytest.mark.parametrize("failure,stage", [("open", "camera_open"), ("setting", "camera_settings")])
 def test_setup_failure_does_not_retry(tmp_path, monkeypatch, failure, stage):
+    """オープン失敗や設定拒否の後に再オープンを許さず、デバイス解放を行えることを確認する。"""
     cap = FakeCapture()
     cap.fail_open = failure == "open"
     cap.reject_prop = cv2.CAP_PROP_FOCUS if failure == "setting" else None
@@ -134,6 +145,7 @@ def test_setup_failure_does_not_retry(tmp_path, monkeypatch, failure, stage):
     (True, np.zeros((48, 64, 3), dtype=np.float32)),
 ])
 def test_bad_frames_latch_failure(tmp_path, monkeypatch, bad_read):
+    """取得失敗・画像なし・寸法違い・dtype違いを拒否し、次回の撮影でもI/Oを再試行しないことを確認する。"""
     camera, cap = camera_for(tmp_path, monkeypatch)
     camera.open()
     cap.bad_read = bad_read
@@ -150,6 +162,7 @@ def test_bad_frames_latch_failure(tmp_path, monkeypatch, bad_read):
 
 @pytest.mark.parametrize("ticks", [[10, 12], [10, 9], [10, float("nan")], [True]])
 def test_camera_time_faults(tmp_path, monkeypatch, ticks):
+    """読取り時間超過・時計逆行・NaN・boolの時刻を、warmup時点でも検出することを確認する。"""
     camera, _ = camera_for(tmp_path, monkeypatch, clock=iter(ticks).__next__)
     with pytest.raises(CameraDiagnosticError) as error:
         camera.open()
@@ -159,6 +172,7 @@ def test_camera_time_faults(tmp_path, monkeypatch, ticks):
 
 @pytest.mark.parametrize("failure,stage", [("encode", "image_encode"), ("write", "image_write")])
 def test_png_failures_latch_and_keep_evidence(tmp_path, monkeypatch, failure, stage):
+    """PNG圧縮または書込み失敗を段階別に記録し、再撮影を拒否して例外中の秘密パスを表に出さないことを確認する。"""
     camera, cap = camera_for(tmp_path, monkeypatch)
     camera.open()
     if failure == "encode":
@@ -182,6 +196,7 @@ def test_png_failures_latch_and_keep_evidence(tmp_path, monkeypatch, failure, st
 
 
 def test_existing_image_is_never_overwritten(tmp_path, monkeypatch):
+    """同じ連番のPNGが存在する場合は保存失敗とし、既存の証跡を上書きしないことを確認する。"""
     camera, _ = camera_for(tmp_path, monkeypatch)
     path = camera.image_dir / "frame_000000.png"
     path.write_bytes(b"previous evidence")
@@ -195,6 +210,10 @@ def test_existing_image_is_never_overwritten(tmp_path, monkeypatch):
 
 def test_fake_camera_cli_saves_paired_frames_without_opening_video(tmp_path, monkeypatch):
     # 子プロセスでもfake分岐のためVideoCaptureを呼ばない。直接経路でもtrapを検証する。
+    """模擬カメラで関節・画像3組を保存し、画像番号・画素値・取得順序・集計の対応を確認する。
+
+    直接呼出しではVideoCapture禁止を検査し、CLI経路は実子プロセスで試す。
+    """
     monkeypatch.setattr(cv2, "VideoCapture", lambda *a, **k: pytest.fail("must not open camera"))
     camera = DiagnosticCamera(device="fake", image_dir=tmp_path, width=64, height=48,
                               fps=30, focus=230, warmup_frames=1, max_read_s=1, fake=True)
@@ -229,6 +248,7 @@ def test_fake_camera_cli_saves_paired_frames_without_opening_video(tmp_path, mon
 @pytest.mark.parametrize("failure,stage", [(None, None), ("read", "camera_read"),
                                           ("close", "camera_close"), ("open", "camera_open")])
 def test_hardware_pair_path_never_writes_motors_and_closes_both(tmp_path, monkeypatch, failure, stage):
+    """組取得の正常時とカメラ起動・読取り・解放失敗時に、バスとカメラ双方の終了処理を試すことを確認する。"""
     bus = ReadOnlyBus()
     cap = FakeCapture()
     if failure == "read":
@@ -262,6 +282,7 @@ def test_hardware_pair_path_never_writes_motors_and_closes_both(tmp_path, monkey
     ["--camera-focus", "230"], ["--camera-width", "0"], ["--max-camera-read-s", "nan"],
 ])
 def test_invalid_camera_arguments_never_launch(tmp_path, monkeypatch, options):
+    """模擬モードと実デバイス指定の混在、フォーカス不足、寸法・時間の不正を起動前に拒否することを確認する。"""
     monkeypatch.setattr(diagnostic, "supervise", lambda *a: pytest.fail("must not launch"))
     output = tmp_path / "absent.jsonl"
     with pytest.raises(SystemExit):
@@ -270,6 +291,7 @@ def test_invalid_camera_arguments_never_launch(tmp_path, monkeypatch, options):
 
 
 def test_existing_image_folder_is_not_reused(tmp_path, monkeypatch):
+    """既存画像フォルダーがあれば子を起動せず、保存済みの証跡を残すことを確認する。"""
     output = tmp_path / "test.jsonl"
     folder = diagnostic.image_directory(output)
     folder.mkdir()
@@ -281,6 +303,7 @@ def test_existing_image_folder_is_not_reused(tmp_path, monkeypatch):
 
 
 def test_pair_read_failure_keeps_previous_pair_and_does_not_retry(tmp_path, monkeypatch):
+    """1組保存後に次の画像取得を失敗させ、正常な1組だけを残して再取得・完了報告をしないことを確認する。"""
     bus = ReadOnlyBus()
     cap = FakeCapture()
     original_read = cap.read
@@ -313,6 +336,7 @@ def test_pair_read_failure_keeps_previous_pair_and_does_not_retry(tmp_path, monk
 
 
 def test_hung_camera_read_is_stopped_by_supervisor(tmp_path):
+    """子のカメラ読取りを長時間sleepへ置き換え、親の期限監視が停止し、正常完了を報告しないことを確認する。"""
     output = tmp_path / "hung_camera.jsonl"
     diagnostic.image_directory(output).mkdir()
     code = (

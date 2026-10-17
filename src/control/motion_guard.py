@@ -31,6 +31,7 @@ class MotionRejectedError(ValueError):
 
 
 def _number(value: object, name: str) -> float:
+    """値を有限なfloatへそろえる。boolや欠損を拒否し、nameで問題箇所を示す。"""
     if type(value) not in (int, float) or not math.isfinite(value):
         raise MotionRejectedError(f"{name}: expected finite number")
     return float(value)
@@ -150,6 +151,7 @@ class MotionGuard:
         if not self.min_interval_s <= interval <= self.max_interval_s:
             raise MotionRejectedError("Send interval is too short, too long or clock moved backwards")
         result = MotionCheck(tuple(reference.items()), source, checked_at, capture_time, interval, age, capture_end)
+        # 送信後に時間を測り直して許容量を増やさないよう、この検査時点の条件を保存する。
         self.validate_target(candidate, result)
         return result
 

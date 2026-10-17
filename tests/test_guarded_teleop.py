@@ -1,4 +1,8 @@
-"""二つの模擬バスで、起動時保持・絶対目標への段階追従・全軸解除を確認する。"""
+"""Leader/Followerの2つの模擬バスで、起動時保持・段階追従・全軸解除を検証する。
+
+時計も差し替え、端点超過・通信失敗・部分的なトルク操作を再現する。
+検査対象は制御の分岐とログであり、実機の衝突や把持を再現する物理シミュレーターではない。
+"""
 
 import hashlib
 import io
@@ -15,6 +19,7 @@ from test_diagnose_observation import ReadOnlyBus, records
 
 
 class Clock:
+    """呼出しごとに2 ms進み、sleepでも待たずに時刻だけ進める、制御可能な単調時計。"""
     now = 10.0
 
     def __call__(self):
@@ -26,6 +31,11 @@ class Clock:
 
 
 class TeleopBus(ReadOnlyBus):
+    """生位置・目標・トルクをメモリで保持し、有効な軸だけ目標へ即追従するバス代役。
+
+    pan_stepとgripper_samplesで手動入力を再現し、各fail属性で通信失敗を注入する。
+    targetsは位置目標、writesはトルク操作の履歴で、操作順と再試行の有無を調べる。
+    """
     def __init__(self, calibration, clock):
         super().__init__()
         self.calibration = calibration
@@ -53,6 +63,7 @@ class TeleopBus(ReadOnlyBus):
         return super().read(register, motor, normalize=normalize, num_retry=num_retry)
 
     def sync_read(self, register, *, normalize, num_retry):
+        """指定した回数で失敗させたりLeaderの姿勢を進めたりしながら、生位置のコピーを返す。"""
         assert register == "Present_Position" and not normalize and num_retry == 0
         self.clock.now += 0.002
         if self.read_count:
@@ -65,6 +76,7 @@ class TeleopBus(ReadOnlyBus):
         return dict(self.raw)
 
     def sync_write(self, register, values, *, normalize, num_retry):
+        """目標を適用・記録した後に失敗も起こせる同期送信。応答なしでも指令が届いた状況を模擬する。"""
         assert register == "Goal_Position" and not normalize and num_retry == 0
         assert set(values) == set(MOTOR_IDS)
         self.clock.now += 0.002
@@ -77,6 +89,7 @@ class TeleopBus(ReadOnlyBus):
             raise ConnectionError("SECRET_PORT")
 
     def write(self, register, motor, value, *, normalize, num_retry):
+        """軸別のON/OFFを記録し、ON適用後の応答喪失とOFF適用前の通信失敗を再現する。"""
         assert register == "Torque_Enable" and not normalize and num_retry == 0
         self.clock.now += 0.002
         self.writes.append((motor, value))
@@ -90,6 +103,7 @@ class TeleopBus(ReadOnlyBus):
 
 
 def setup(tmp_path, monkeypatch, execute=True, tolerance_ticks=8):
+    """校正の異なる2機と模擬時計を準備し、Follower初期姿勢にずれを入れて段階追従を試せるようにする。"""
     clock = Clock()
     monkeypatch.setattr(teleop.time, "monotonic", clock)
     monkeypatch.setattr(teleop.time, "sleep", clock.sleep)
@@ -109,12 +123,14 @@ def setup(tmp_path, monkeypatch, execute=True, tolerance_ticks=8):
 
 
 def run(args):
+    """テレオペの子側入口を実行し、終了コードと解析済みイベントを返す。"""
     stream = io.StringIO()
     code = teleop.run_worker(args, stream)
     return code, records(stream.getvalue())
 
 
 def test_preview_never_writes_or_enables(tmp_path, monkeypatch):
+    """読取り専用では両機を継続観測するが送信・トルク操作を行わず、生値と時刻を記録することを確認する。"""
     args, buses = setup(tmp_path, monkeypatch, execute=False)
     code, events = run(args)
     assert code == 0 and events[-1] == {"event": "complete", "executed": False}
@@ -134,6 +150,7 @@ def test_preview_never_writes_or_enables(tmp_path, monkeypatch):
 def test_gripper_range_fault_identifies_source_and_never_sends_next_target(
     tmp_path, monkeypatch, role, boundary, execute,
 ):
+    """端点許容を0にし、両機・両端の1 tick超過で発生元と超過量を記録して次の送信を止めることを確認する。"""
     args, buses = setup(tmp_path, monkeypatch, execute=execute, tolerance_ticks=0)
     bus = buses[role]
     cal = bus.calibration["gripper"]
@@ -167,6 +184,7 @@ def test_gripper_range_fault_identifies_source_and_never_sends_next_target(
 
 @pytest.mark.parametrize("role", ["leader", "follower"])
 def test_initial_gripper_range_fault_is_reported_before_any_write(tmp_path, monkeypatch, role):
+    """初回から爪が校正範囲外なら、どちらの機体でも全ての書込み前に失敗することを確認する。"""
     args, buses = setup(tmp_path, monkeypatch, tolerance_ticks=0)
     bus = buses[role]
     bus.raw["gripper"] = bus.calibration["gripper"]["range_max"]+1
@@ -183,6 +201,7 @@ def test_initial_gripper_range_fault_is_reported_before_any_write(tmp_path, monk
 def test_shoulder_observation_range_fault_has_role_and_raw_values(
     tmp_path, monkeypatch, role, initial, execute,
 ):
+    """肩の範囲外観測を初回・周期中に注入し、発生機体と生値を残して送信を止め、実行中なら解除することを確認する。"""
     args, buses = setup(tmp_path, monkeypatch, execute=execute)
     bus = buses[role]
     raw = bus.calibration["shoulder_lift"]["range_max"]+55
@@ -215,6 +234,7 @@ def test_shoulder_observation_range_fault_has_role_and_raw_values(
 
 
 def test_absolute_teleop_primes_current_pose_and_only_writes_follower(tmp_path, monkeypatch):
+    """Followerの現在姿勢を最初の目標にし、Leaderとの絶対姿勢差を徐々に減らし、Leaderへは書かないことを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     follower, leader = buses["follower"], buses["leader"]
     initial = dict(follower.raw)
@@ -235,6 +255,7 @@ def test_absolute_teleop_primes_current_pose_and_only_writes_follower(tmp_path, 
 
 
 def test_large_leader_change_is_followed_gradually(tmp_path, monkeypatch):
+    """Leaderを大きく動かしても、Followerの各目標変化が2度以内に制限されることを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     buses["leader"].pan_step = 100
     code, events = run(args)
@@ -246,6 +267,7 @@ def test_large_leader_change_is_followed_gradually(tmp_path, monkeypatch):
 
 
 def test_tick_limiter_respects_step_and_rate_for_arm_and_gripper():
+    """複数の経過時間で、腕・爪の整数tick化後も1回の変化量と速度×時間の小さい方を越えないことを確認する。"""
     calibration = json.loads(Path("configs/calibration_snapshots/my_follower_for_004.json").read_bytes())
     guard = ActionGuard.from_calibration(Path("configs/calibration_snapshots/my_follower_for_004.json"))
     previous = {f"{name}.pos": 30.0 if name == "gripper" else 0.0 for name in MOTOR_IDS}
@@ -260,6 +282,7 @@ def test_tick_limiter_respects_step_and_rate_for_arm_and_gripper():
 
 
 def test_out_of_follower_range_leader_pose_refused_before_enable(tmp_path, monkeypatch):
+    """Leader自身の範囲内でもFollowerの範囲外となる姿勢は、起動前に拒否することを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     # LeaderのF4校正範囲はFollowerより広い。範囲外目標へは徐々にも移動しない。
     buses["leader"].raw["wrist_flex"] = buses["leader"].calibration["wrist_flex"]["range_min"]+1
@@ -272,6 +295,7 @@ def test_out_of_follower_range_leader_pose_refused_before_enable(tmp_path, monke
 
 
 def test_follower_wrist_target_limit_still_faults_during_teleop(tmp_path, monkeypatch):
+    """周期中にLeaderがFollowerのF4範囲を越えた場合も、段階追従で隠さずFAULTとして解除することを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     leader = buses["leader"]
     original_read = leader.sync_read
@@ -296,6 +320,7 @@ def test_follower_wrist_target_limit_still_faults_during_teleop(tmp_path, monkey
 
 
 def test_partial_enable_failure_releases_every_attempted_motor(tmp_path, monkeypatch):
+    """3軸目のON応答を失った場合、試みた3軸すべてを逆順にOFFへ戻すことを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     follower = buses["follower"]
     follower.fail_enable = "elbow_flex"
@@ -308,6 +333,7 @@ def test_partial_enable_failure_releases_every_attempted_motor(tmp_path, monkeyp
 
 
 def test_send_failure_never_retries_and_releases_all(tmp_path, monkeypatch):
+    """位置送信の応答喪失を送信結果不明として記録し、再送せず全軸解除することを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     follower = buses["follower"]
     follower.fail_send = True
@@ -322,6 +348,7 @@ def test_send_failure_never_retries_and_releases_all(tmp_path, monkeypatch):
 
 
 def test_one_release_failure_does_not_skip_other_motors(tmp_path, monkeypatch):
+    """1軸の解除書込み失敗でも残りの解除を続け、未確認軸と失敗操作を報告することを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     follower = buses["follower"]
     follower.fail_off = "elbow_flex"
@@ -340,6 +367,7 @@ def test_one_release_failure_does_not_skip_other_motors(tmp_path, monkeypatch):
 def test_read_communication_failure_reports_role_and_stops_before_next_send(
     tmp_path, monkeypatch, role, execute,
 ):
+    """両機の読取り失敗を発生元・レジスタ付きで記録し、次の送信や再読取りを行わないことを確認する。"""
     args, buses = setup(tmp_path, monkeypatch, execute=execute)
     buses[role].fail_read_at = 2
     code, events = run(args)
@@ -362,6 +390,7 @@ def test_read_communication_failure_reports_role_and_stops_before_next_send(
 def test_gripper_off_unconfirmed_is_reported_while_other_axes_are_released(
     tmp_path, monkeypatch, capsys, failure_operation,
 ):
+    """爪のOFF書込み失敗と読戻し失敗を区別して残し、他軸を解除しつつ操作者へ未確認を伝えることを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     follower = buses["follower"]
     follower.fail_read_at = 2
@@ -398,6 +427,10 @@ def test_gripper_off_unconfirmed_is_reported_while_other_axes_are_released(
 def test_small_leader_gripper_endpoint_excess_is_logged_and_bounded(
     tmp_path, monkeypatch, execute, boundary, excess,
 ):
+    """Leader爪の許容内超過は端へそろえて生値と調整を残し、範囲内へ戻ると解除通知を出すことを確認する。
+
+    Followerの範囲と各指令の変化量は、入力端点の調整によって広がらないことも確かめる。
+    """
     args, buses = setup(tmp_path, monkeypatch, execute=execute)
     leader = buses["leader"]
     cal = leader.calibration["gripper"]
@@ -437,6 +470,7 @@ def test_small_leader_gripper_endpoint_excess_is_logged_and_bounded(
 
 @pytest.mark.parametrize("boundary", ["lower", "upper"])
 def test_initial_leader_endpoint_processing_is_logged_before_enable(tmp_path, monkeypatch, boundary):
+    """初回のLeader爪端点調整も元の生値とともに記録し、Followerは自身の現在位置から保持を始めることを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     leader, follower = buses["leader"], buses["follower"]
     cal = leader.calibration["gripper"]
@@ -460,6 +494,7 @@ def test_initial_leader_endpoint_processing_is_logged_before_enable(tmp_path, mo
 def test_endpoint_tolerance_never_extends_follower_range_or_accepts_large_excess(
     tmp_path, monkeypatch, role, excess, boundary, execute,
 ):
+    """Leaderの9 tick超過とFollowerの1 tick超過は、入力端点許容の対象外として拒否することを確認する。"""
     args, buses = setup(tmp_path, monkeypatch, execute=execute)
     bus = buses[role]
     cal = bus.calibration["gripper"]
@@ -476,6 +511,7 @@ def test_endpoint_tolerance_never_extends_follower_range_or_accepts_large_excess
 
 @pytest.mark.parametrize("invalid", [3213.0, float("nan"), None, True, -1, 65535])
 def test_leader_input_processing_rejects_invalid_raw_values(tmp_path, monkeypatch, invalid):
+    """整数でない値・欠損・bool・生位置の表現範囲外は、端点処理で補正せず拒否することを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     leader = buses["leader"]
     leader.gripper_samples = [leader.raw["gripper"], invalid]
@@ -489,6 +525,7 @@ def test_leader_input_processing_rejects_invalid_raw_values(tmp_path, monkeypatc
 
 
 def test_display_warns_using_common_wrist_range_and_limits_status_output(capsys):
+    """警告に両機の共通範囲を使い、同じ警告を連発せず関節表示を約1秒間隔にすることを確認する。"""
     stream = io.StringIO()
     leader_guard = ActionGuard.from_calibration(Path("configs/calibration_snapshots/my_leader_for_004.json"))
     follower_guard = ActionGuard.from_calibration(Path("configs/calibration_snapshots/my_follower_for_004.json"))
@@ -512,6 +549,7 @@ def test_display_warns_using_common_wrist_range_and_limits_status_output(capsys)
 
 @pytest.mark.parametrize("ticks", [-1, 9])
 def test_cli_rejects_unreviewed_tolerance_before_connecting(tmp_path, monkeypatch, ticks):
+    """許容幅0〜8 ticksを外れるCLI指定では、ログ作成や接続より前に拒否することを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     argv = ["--output", str(tmp_path / "not_created.jsonl"),
             "--leader-gripper-tolerance-ticks", str(ticks)]
@@ -528,6 +566,7 @@ def test_cli_rejects_unreviewed_tolerance_before_connecting(tmp_path, monkeypatc
 
 @pytest.mark.parametrize("duration", [30, 60])
 def test_guided_run_labels_operator_instructions_but_sends_only_leader_targets(tmp_path, monkeypatch, duration):
+    """30秒・60秒の工程案内が時刻と次フレームへ対応し、案内自体が把持・投入目標を生成しないことを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     args.guide_pick_place, args.duration_s = True, duration
     buses["leader"].pan_step = 0  # 案内だけでは把持・投入の指令を生成しないこと。
@@ -552,6 +591,7 @@ def test_guided_run_labels_operator_instructions_but_sends_only_leader_targets(t
 
 
 def test_guided_run_stops_announcing_on_read_failure_and_releases(tmp_path, monkeypatch):
+    """案内付き実行の読取り失敗後は次工程を案内せず、起動時保持だけで止めて解除することを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     args.guide_pick_place, args.duration_s = True, 30
     buses["follower"].fail_read_at = 2
@@ -565,6 +605,7 @@ def test_guided_run_stops_announcing_on_read_failure_and_releases(tmp_path, monk
 
 @pytest.mark.parametrize("execute,duration", [(False, 30), (True, 10), (True, 45)])
 def test_guide_cli_requires_executed_supported_duration(tmp_path, monkeypatch, execute, duration):
+    """工程案内には実行指定と30秒または60秒が必要で、それ以外は接続前に拒否することを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     argv = ["--output", str(tmp_path / "not_created.jsonl"), "--guide-pick-place",
             "--duration-s", str(duration)]
@@ -583,6 +624,7 @@ def test_guide_cli_requires_executed_supported_duration(tmp_path, monkeypatch, e
 
 @pytest.mark.parametrize("guided", [False, True])
 def test_sixty_second_cli_requires_guide_and_passes_bounded_worker_timeout(tmp_path, monkeypatch, guided):
+    """60秒実行は工程案内付きの場合だけ受け付け、子へ引数と75秒の監視期限を渡すことを確認する。"""
     args, buses = setup(tmp_path, monkeypatch)
     output = tmp_path / "sixty_seconds.jsonl"
     argv = ["--output", str(output), "--duration-s", "60", "--execute"]

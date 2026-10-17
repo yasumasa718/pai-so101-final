@@ -88,6 +88,7 @@ class RecordStartupCheck:
         for motor in MOTOR_IDS:
             entry = loaded[motor]
             for name in CALIBRATION_FIELDS:
+                # JSONの辞書とLeRobotの校正オブジェクトを、同じフィールド単位で比較する。
                 value = entry.get(name) if isinstance(entry, Mapping) else getattr(entry, name, None)
                 if type(value) is not int or value != calibration[motor][name]:
                     raise StartupCheckError(f"Loaded Follower calibration mismatch: {motor}.{name}")

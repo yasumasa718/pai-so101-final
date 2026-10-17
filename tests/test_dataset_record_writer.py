@@ -26,6 +26,7 @@ JOINTS = (
 
 
 def features(*, camera: bool = False, swap: bool = False) -> dict[str, dict[str, Any]]:
+    """6軸の保存スキーマを作る。swapで指令の並びだけを反転し、cameraで画像特徴量を追加する。"""
     action_names = list(reversed(JOINTS)) if swap else list(JOINTS)
     state_names = list(JOINTS) if swap else list(JOINTS)
     result = {
@@ -40,10 +41,12 @@ def features(*, camera: bool = False, swap: bool = False) -> dict[str, dict[str,
 
 
 def action() -> dict[str, float]:
+    """軸ごとに異なる値を持つ指令を作り、配列の並び違いを検出しやすくする。"""
     return dict(zip(JOINTS, (0., 5., 10., -15., 20., 50.)))
 
 
 def observation(*, camera: bool = False) -> dict[str, Any]:
+    """指令と区別できる爪42の観測を作る。必要なら2×3画素の既知画像も付ける。"""
     obs: dict[str, Any] = {**action(), "gripper.pos": 42.0}
     if camera:
         obs["top"] = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
@@ -52,6 +55,7 @@ def observation(*, camera: bool = False) -> dict[str, Any]:
 
 @dataclass
 class FakeDataset:
+    """フレーム追加・保存・破棄・終了をメモリで模擬し、部分更新後の失敗も注入できる保存先。"""
     features: dict[str, dict[str, Any]] = field(default_factory=features)
     added: list[dict[str, Any]] = field(default_factory=list)
     saved: list[list[dict[str, Any]]] = field(default_factory=list)
@@ -91,10 +95,12 @@ class FakeDataset:
 
 @pytest.fixture
 def dataset() -> FakeDataset:
+    """各テストで履歴が混ざらないよう、新しい模擬保存先を返すfixture。"""
     return FakeDataset()
 
 
 def test_one_frame_is_buffered_with_sent_action_and_task(dataset):
+    """送信戻り値47と観測42を別々にfloat32で保持し、時刻・番号は追加せず、エピソード保存はまだ行わないことを確認する。"""
     writer = DatasetRecordWriter(dataset, "Pick the crushed can")
     writer.stage_observation(observation())
     sent = {**action(), "gripper.pos": 47.}
@@ -112,6 +118,7 @@ def test_one_frame_is_buffered_with_sent_action_and_task(dataset):
 
 
 def test_feature_name_order_used_instead_of_assuming_f1_to_f6():
+    """指令と観測の特徴量順が異なっていても、それぞれの名前順で配列化することを確認する。"""
     ds = FakeDataset(features=features(swap=True))
     writer = DatasetRecordWriter(ds, "task")
     writer.stage_observation(observation())
@@ -121,6 +128,7 @@ def test_feature_name_order_used_instead_of_assuming_f1_to_f6():
 
 
 def test_image_copied_when_staged_and_matches_features():
+    """観測を預けた後に元画像を書き換えても、保存用の画像コピーへ影響しないことを確認する。"""
     ds = FakeDataset(features=features(camera=True))
     writer = DatasetRecordWriter(ds, "task")
     obs = observation(camera=True)
@@ -132,6 +140,7 @@ def test_image_copied_when_staged_and_matches_features():
 
 
 def test_save_episode_explicit_and_finalize(dataset):
+    """空エピソードは拒否し、2フレームを明示保存して終了した後は追加観測を拒否することを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     with pytest.raises(DatasetWriterStateError, match="empty"):
         writer.save_episode()
@@ -148,6 +157,7 @@ def test_save_episode_explicit_and_finalize(dataset):
 
 
 def test_can_save_separate_complete_episodes(dataset):
+    """正常保存後にwriterを使い続け、別々の2エピソードを保存できることを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     for _ in range(2):
         writer.stage_observation(observation())
@@ -158,6 +168,7 @@ def test_can_save_separate_complete_episodes(dataset):
 
 
 def test_double_stage_rejected_and_no_commit(dataset):
+    """送信結果待ちの観測へ重ねて預ける操作と保存を拒否し、明示破棄で終了できることを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     writer.stage_observation(observation())
     with pytest.raises(DatasetWriterStateError):
@@ -170,6 +181,7 @@ def test_double_stage_rejected_and_no_commit(dataset):
 
 
 def test_call_without_stage_rejected(dataset):
+    """対応する観測を預けずに送信指令だけを渡すと、フレームを追加しないことを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     with pytest.raises(DatasetWriterStateError):
         writer(action())
@@ -178,6 +190,7 @@ def test_call_without_stage_rejected(dataset):
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), None, True, "1"])
 def test_bad_action_latches_writer_fault(dataset, value):
+    """非有限値・欠損・bool・文字列の送信指令を追加せず、writerをFAULTとして保持することを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     writer.stage_observation(observation())
     target = action()
@@ -192,6 +205,7 @@ def test_bad_action_latches_writer_fault(dataset, value):
 
 
 def test_bad_observation_latches_fault_before_send(dataset):
+    """軸の欠けた観測は預ける段階で拒否し、送信前に停止できることを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     bad = observation()
     del bad["wrist_flex.pos"]
@@ -203,6 +217,7 @@ def test_bad_observation_latches_fault_before_send(dataset):
 
 
 def test_bad_image_rejected(dataset):
+    """uint8を要求する画像特徴量へfloat32画像を渡すと、観測準備がFAULTになることを確認する。"""
     dataset.features = features(camera=True)
     writer = DatasetRecordWriter(dataset, "task")
     obs = observation(camera=True)
@@ -213,6 +228,7 @@ def test_bad_image_rejected(dataset):
 
 
 def test_buffer_discard_on_fault_and_no_retry(dataset):
+    """途中のフレーム追加失敗後は保存を拒否し、明示的に一時データを捨てたwriterを再利用できないことを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     writer.stage_observation(observation())
     writer(action())
@@ -230,6 +246,7 @@ def test_buffer_discard_on_fault_and_no_retry(dataset):
 
 
 def test_save_failure_cannot_claim_rollback(dataset):
+    """部分的に保存された可能性がある失敗ではcommit_uncertainを保持し、破棄や終了で復旧扱いにしないことを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     writer.stage_observation(observation())
     writer(action())
@@ -246,6 +263,7 @@ def test_save_failure_cannot_claim_rollback(dataset):
 
 
 def test_abort_never_finalizes_or_disconnects(dataset):
+    """abortは未保存フレームの破棄だけを行い、finalizeは別途明示的に呼ぶことを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     writer.stage_observation(observation())
     writer(action())
@@ -258,6 +276,7 @@ def test_abort_never_finalizes_or_disconnects(dataset):
 
 
 def test_cleanup_failure_latches_fault(dataset):
+    """一時データ破棄の失敗をFAULTにし、終了処理へ進まないことを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     dataset.fail_clear = True
     with pytest.raises(OSError):
@@ -267,6 +286,7 @@ def test_cleanup_failure_latches_fault(dataset):
 
 
 def test_invalid_feature_schema_rejected_before_any_frames():
+    """重複した関節名や未対応の特徴量を、writer構築時に拒否することを確認する。"""
     bad = features()
     bad["action"]["names"] = ["wrist_flex.pos"] * 6
     with pytest.raises(ValueError):
@@ -278,6 +298,7 @@ def test_invalid_feature_schema_rejected_before_any_frames():
 
 
 def test_finalize_fails_for_unsaved_episode(dataset):
+    """未保存フレームが残る状態では、データセットの終了処理を呼ばないことを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     writer.stage_observation(observation())
     writer(action())
@@ -287,7 +308,7 @@ def test_finalize_fails_for_unsaved_episode(dataset):
 
 
 def test_safe_record_loop_callback_contract(tmp_path: Path):
-    """実際の 1 フレーム収録ループと検査を、模擬の保存先・送信先につないで検証する。"""
+    """収録ループが送信戻り値をwriterへ渡し、要求値と異なる爪47を保存する結合を確認する。"""
     from src.control.action_guard import ActionGuard, MOTOR_IDS
     from src.control.safe_record_loop import RecordFault, SafeRecordLoop, RecordState
     import json
@@ -328,6 +349,7 @@ def test_safe_record_loop_callback_contract(tmp_path: Path):
 
 
 def test_safe_record_loop_fault_requires_explicit_dataset_abort(tmp_path: Path):
+    """送信前にループがFAULTになったとき、預けた観測は自動保存せず、呼出し側の明示破棄を必要とすることを確認する。"""
     from src.control.action_guard import ActionGuard, MOTOR_IDS
     from src.control.safe_record_loop import RecordFault, SafeRecordLoop, RecordState
     import json
@@ -368,7 +390,7 @@ def test_safe_record_loop_fault_requires_explicit_dataset_abort(tmp_path: Path):
 
 
 def test_real_lerobot_dataset_roundtrip_without_robot(tmp_path: Path):
-    """LeRobot 0.6.1 をインストールした WSL2 環境で実行する統合テスト。"""
+    """実LeRobotDatasetへ1フレームを書いてParquetを読み戻し、指令47と観測42が別々に残ることを確認する。"""
     pytest.importorskip("lerobot")
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     import pyarrow.parquet as pq
@@ -392,6 +414,7 @@ def test_real_lerobot_dataset_roundtrip_without_robot(tmp_path: Path):
 
 
 def test_nonfinite_observation_fails_before_append(dataset):
+    """観測にNaNがあれば、フレームを追加する前に拒否することを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     obs = observation()
     obs["gripper.pos"] = float("nan")
@@ -402,6 +425,7 @@ def test_nonfinite_observation_fails_before_append(dataset):
 
 
 def test_extra_observation_key_fails_before_append(dataset):
+    """未定義の観測キーを黙って捨てず、追加前に拒否することを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     obs = observation()
     obs["debug_value"] = 13
@@ -412,6 +436,7 @@ def test_extra_observation_key_fails_before_append(dataset):
 
 
 def test_failed_finalize_never_claims_success(dataset):
+    """保存後のfinalize失敗でも正常終了とせず、FAULTと保存結果不明を保持することを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     writer.stage_observation(observation())
     writer(action())
@@ -424,6 +449,7 @@ def test_failed_finalize_never_claims_success(dataset):
 
 
 def test_writer_failure_does_not_allow_save_even_after_partial_frame(dataset):
+    """add_frameが一部を更新してから失敗しても保存は禁止し、明示破棄で一時データだけを消すことを確認する。"""
     writer = DatasetRecordWriter(dataset, "task")
     writer.stage_observation(observation())
     dataset.fail_add = True

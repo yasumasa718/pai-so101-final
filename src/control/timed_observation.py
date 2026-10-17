@@ -17,24 +17,35 @@ from src.control.action_guard import ActionGuard, MOTOR_IDS
 
 
 class PositionReader(Protocol):
+    """TimedJointReaderが必要とする最小の読取り口。実バスと模擬バスの双方で実装する。"""
+
     def sync_read(self, data_name: str, *, normalize: bool, num_retry: int) -> Mapping[str, object]: ...
 
 
 @dataclass(frozen=True)
 class TimedJointObservation:
+    """6軸の位置とホストの読取り区間を保持する。時刻の単位は単調時計の秒。
+
+    positionsは<joint>.posと位置の組をtupleで保持し、加工処理へ渡すときだけ
+    as_observation()で新しい辞書にする。位置の単位は読取り時のguardに従う。
+    """
+
     positions: tuple[tuple[str, float], ...]
     read_started_at: float
     read_completed_at: float
 
     @property
     def read_duration_s(self) -> float:
+        """ホストで測った読取り所要秒数。センサー内部の測定周期ではない。"""
         return self.read_completed_at - self.read_started_at
 
     def as_observation(self) -> dict[str, float]:
+        """保持している観測を変更せず、制御処理に渡せる独立した辞書を返す。"""
         return dict(self.positions)
 
 
 def finite_time(value: object) -> float:
+    """有限かつ非負の数値だけを時刻・時間として受け付け、floatへそろえる。"""
     if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
         raise ValueError("Expected a finite nonnegative monotonic timestamp")
     return float(value)
@@ -72,6 +83,11 @@ class TimedJointReader:
         self._previous: TimedJointObservation | None = None
 
     def read(self) -> TimedJointObservation:
+        """6軸を1回読み、範囲と読取り区間を検査した観測を返す。
+
+        前回より古い時刻、欠損値、範囲外、長すぎる通信は拒否する。
+        通信例外や割込みもfaultに保持し、このインスタンスでの再試行を禁止する。
+        """
         if self.fault is not None:
             raise RuntimeError("Reader is faulted; no retry") from self.fault
         try:

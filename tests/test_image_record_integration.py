@@ -1,4 +1,9 @@
-"""実際の LeRobot で画像・動画の保存から終了までを検証する。実機・カメラ・ネットワークは使わない。"""
+"""実LeRobotで、画像・動画の保存から終了までを検証する結合テスト。
+
+ロボットは模擬し、既知の合成画像を一時フォルダーへPNG・Parquet・H.264として保存する。
+同期保存とスレッド保存、保存後の読戻し、欠損画像、部分保存、後片付け失敗を試す。
+実機・カメラ・ネットワークは使わない。
+"""
 
 from __future__ import annotations
 
@@ -34,11 +39,13 @@ SHAPE = (64, 64, 3)
 
 @dataclass
 class FakeConfig:
+    """開始前検査に必要な度単位設定だけを持つ代役。"""
     use_degrees: bool = True
 
 
 @dataclass
 class FakeRobot:
+    """要求値と違う爪位置を返し、元の要求ではなく送信戻り値が保存されるか確認できる送信先。"""
     calibration: dict[str, Any]
     config: FakeConfig = field(default_factory=FakeConfig)
     calls: list[dict[str, float]] = field(default_factory=list)
@@ -59,12 +66,14 @@ class FakeRobot:
 
 @dataclass
 class Recording:
+    """Dataset・セッション・送信先と画像／動画モードをまとめるテスト用の入れ物。"""
     dataset: LeRobotDataset
     session: SafeRecordSession
     robot: FakeRobot
     mode: str
 
     def next_episode(self) -> None:
+        """writerと開始前検査を引き継ぎ、未使用のループとセッションで次エピソードを準備する。"""
         previous = self.session
         loop = SafeRecordLoop(previous.loop.guard, lambda p: p[0], lambda p: p[0], self.robot, previous.writer)
         self.session = SafeRecordSession(loop, previous.writer, startup_check=previous.startup_check)
@@ -72,6 +81,7 @@ class Recording:
 
 @pytest.fixture
 def make_recording(tmp_path: Path) -> Iterator[Callable[..., Recording]]:
+    """保存方式・スレッド数を指定して実Datasetを作る関数を提供し、終了時にファイル資源を解放するfixture。"""
     closers: list[Callable[[], None]] = []
 
     def create(mode: str, *, threads: int = 2, streaming: bool = False) -> Recording:
@@ -111,6 +121,7 @@ def make_recording(tmp_path: Path) -> Iterator[Callable[..., Recording]]:
 
 
 def synthetic_image(index: int) -> np.ndarray:
+    """フレームごとに色と領域の模様が変わるRGB画像を作り、順序違い・色順違いを検出できるようにする。"""
     pixels = np.empty(SHAPE, dtype=np.uint8)
     pixels[:] = ((40 + 20 * index) % 220, (80 + 10 * index) % 220, 140)
     pixels[:32, :32] = (180, (30 + 15 * index) % 220, 60)
@@ -119,6 +130,7 @@ def synthetic_image(index: int) -> np.ndarray:
 
 
 def frame(recording: Recording, index: int) -> tuple[np.ndarray, list[float], list[float]]:
+    """1フレームを記録し、比較用の画像・送信戻り値・観測配列を返す。元画像を書き換えてコピー保持も試す。"""
     requested = {key: (60.23456789 + index % 10 if key == "gripper.pos" else 1.23456789 + i)
                  for i, key in enumerate(JOINTS)}
     obs = {key: value / 2 for key, value in requested.items()}
@@ -132,12 +144,14 @@ def frame(recording: Recording, index: int) -> tuple[np.ndarray, list[float], li
 
 
 def data_table(recording: Recording) -> pa.Table:
+    """保存された全Parquetをファイル順に読み、1つのテーブルへ連結する。"""
     paths = sorted((recording.dataset.root / "data").rglob("*.parquet"))
     assert paths
     return pa.concat_tables([pq.read_table(path) for path in paths])
 
 
 def decode_images(recording: Recording, table: pa.Table) -> list[np.ndarray]:
+    """画像はParquet内のPNG、動画はMP4から復号する。動画は30 fpsと各フレームの表示時刻も確認する。"""
     if recording.mode == "image":
         result = []
         for value in table[CAMERA].to_pylist():
@@ -155,6 +169,7 @@ def decode_images(recording: Recording, table: pa.Table) -> list[np.ndarray]:
 
 
 def assert_images(recording: Recording, table: pa.Table, expected: list[np.ndarray]) -> None:
+    """フレーム数・寸法・画素を比較する。PNGは完全一致、H.264は圧縮誤差を許容して模様の対応を確かめる。"""
     decoded = decode_images(recording, table)
     assert len(decoded) == len(expected) == table.num_rows
     for actual, original in zip(decoded, expected, strict=True):
@@ -168,6 +183,7 @@ def assert_images(recording: Recording, table: pa.Table, expected: list[np.ndarr
 
 
 def assert_quarantined(recording: Recording) -> None:
+    """保存結果不明を各層で保持し、再保存・破棄・終了・追加送信によって解除されないことを共通検査する。"""
     session = recording.session
     assert session.state is SessionState.FAULT
     assert session.loop.state is RecordState.FAULT
@@ -189,6 +205,7 @@ def assert_quarantined(recording: Recording) -> None:
 @pytest.mark.parametrize("mode", ["image", "video"])
 @pytest.mark.parametrize("threads", [0, 2], ids=["synchronous", "async_threads"])
 def test_two_image_episodes_roundtrip(make_recording: Callable[..., Recording], mode: str, threads: int) -> None:
+    """画像／動画と同期／非同期保存の組合せで2エピソードを読み戻し、指令・観測・画像・時刻・番号の対応を確認する。"""
     recording = make_recording(mode, threads=threads)
     expected_images, expected_actions, expected_states = [], [], []
     for episode in range(2):
@@ -226,6 +243,10 @@ def test_two_image_episodes_roundtrip(make_recording: Callable[..., Recording], 
 def test_abort_waits_for_inflight_images_and_preserves_saved_episode(
     make_recording: Callable[..., Recording], monkeypatch: pytest.MonkeyPatch, mode: str, failure: str,
 ) -> None:
+    """画像保存をEventで待たせ、中断が保存完了を待ってから一時画像を消し、前の保存済みエピソードを残すことを確認する。
+
+    手動中断・範囲拒否・送信失敗の各経路で、削除後に遅い書込みがディレクトリを再作成しないことも調べる。
+    """
     recording = make_recording(mode, threads=1)
     recording.session.start()
     expected = [frame(recording, index)[0] for index in range(2)]
@@ -233,6 +254,7 @@ def test_abort_waits_for_inflight_images_and_preserves_saved_episode(
     recording.next_episode()
     recording.session.start()
     started, release, waiting, finished = (threading.Event() for _ in range(4))
+    # 保存開始→中断の待機開始→保存再開→中断完了をEventで確認し、単なるsleepの推測を避ける。
     errors: list[BaseException] = []
     write = image_writer.write_image
     native = recording.dataset.writer.image_writer
@@ -308,6 +330,7 @@ def test_png_io_failure_does_not_save_normal_episode(
     make_recording: Callable[..., Recording], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
     mode: str, threads: int,
 ) -> None:
+    """LeRobot側がPNG書込み失敗をログだけに残しても、全画像検査がエピソード確定前に検出し、正常データとして保存しないことを確認する。"""
     recording = make_recording(mode, threads=threads)
     recording.session.start()
     real_save = Image.Image.save
@@ -341,11 +364,13 @@ def test_png_io_failure_does_not_save_normal_episode(
 def test_unsampled_missing_video_frame_is_rejected_before_commit(
     make_recording: Callable[..., Recording], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """統計計算の抽出対象外になる1画像を欠落させても、全画像検査で検出して短い動画を保存しないことを確認する。"""
     from lerobot.datasets.compute_stats import sample_indices
 
     recording = make_recording("video")
     length = 101
     missing_index = next(iter(set(range(length)) - set(sample_indices(length))))
+    # 統計の抜き取り検査だけなら見逃す画像を選び、全件検査が必要な理由を再現する。
     missing_path = recording.dataset.writer._get_image_file_path(0, CAMERA, missing_index)
     real_save = Image.Image.save
 
@@ -377,6 +402,7 @@ def test_unsampled_missing_video_frame_is_rejected_before_commit(
 def test_all_images_are_decoded_and_checked_before_native_save(
     make_recording: Callable[..., Recording], monkeypatch: pytest.MonkeyPatch, mode: str, corruption: str,
 ) -> None:
+    """保存済みPNGの破損・寸法違いを実際に作り、LeRobotのエピソード保存を呼ぶ前に拒否することを確認する。"""
     recording = make_recording(mode)
     recording.session.start()
     frame(recording, 0)
@@ -412,6 +438,7 @@ def test_all_images_are_decoded_and_checked_before_native_save(
 
 
 def test_streaming_encoding_is_rejected_before_recording(make_recording: Callable[..., Recording]) -> None:
+    """PNG全件検査に対応しないストリーミング動画変換は、収録部品の構築時に拒否することを確認する。"""
     with pytest.raises(ValueError, match="Streaming encoding is not supported"):
         make_recording("video", streaming=True)
 
@@ -420,6 +447,7 @@ def test_streaming_encoding_is_rejected_before_recording(make_recording: Callabl
 def test_partial_parquet_failure_keeps_uncertainty(
     make_recording: Callable[..., Recording], monkeypatch: pytest.MonkeyPatch, mode: str,
 ) -> None:
+    """実Parquet書込み直後に例外を出し、部分ファイルと一時画像を残して保存結果不明を保持することを確認する。"""
     recording = make_recording(mode)
     recording.session.start()
     frame(recording, 0)
@@ -447,6 +475,7 @@ def test_partial_parquet_failure_keeps_uncertainty(
 def test_video_encoding_failure_preserves_previous_video_and_partial_files(
     make_recording: Callable[..., Recording], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """次エピソードの動画変換に失敗しても、前の動画と失敗途中のファイルを勝手に削除せず使用禁止にすることを確認する。"""
     recording = make_recording("video")
     recording.session.start()
     for index in range(2):
@@ -479,6 +508,7 @@ def test_video_encoding_failure_preserves_previous_video_and_partial_files(
 def test_cleanup_failure_never_reports_successful_abort(
     make_recording: Callable[..., Recording], monkeypatch: pytest.MonkeyPatch, mode: str,
 ) -> None:
+    """実際の一時画像削除後に例外を出し、保存先が片付いていても中断成功とは報告しないことを確認する。"""
     recording = make_recording(mode)
     recording.session.start()
     frame(recording, 0)
@@ -509,6 +539,7 @@ def test_cleanup_failure_never_reports_successful_abort(
 def test_finalization_failure_retains_fault_even_after_native_close(
     make_recording: Callable[..., Recording], monkeypatch: pytest.MonkeyPatch, mode: str,
 ) -> None:
+    """実際の終了処理直後に例外を出し、保存画像が読めてもFAULTと保存結果不明を保持することを確認する。"""
     recording = make_recording(mode)
     recording.session.start()
     expected = [frame(recording, index)[0] for index in range(2)]

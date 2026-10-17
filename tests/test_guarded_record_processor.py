@@ -19,6 +19,7 @@ from src.control.guarded_record_processor import (
 
 @pytest.fixture
 def calibration_path(tmp_path: Path) -> Path:
+    """LeRobotの検査パイプラインに渡す6軸の校正JSONを一時保存する。"""
     ranges = {
         "shoulder_pan": (792, 3306),
         "shoulder_lift": (826, 3209),
@@ -43,6 +44,7 @@ def calibration_path(tmp_path: Path) -> Path:
 
 
 def center_action() -> dict[str, float]:
+    """腕0度・爪50ポイントの、全軸が範囲内の基準指令を作る。"""
     return {
         f"{name}.pos": 50.0 if name == "gripper" else 0.0
         for name in MOTOR_IDS
@@ -50,6 +52,7 @@ def center_action() -> dict[str, float]:
 
 
 def test_complete_action_passes_teleop_pipeline(calibration_path: Path) -> None:
+    """正常指令は値を保った別の辞書として返り、入力との参照共有を避けることを確認する。"""
     processor = make_guarded_teleop_pipeline(calibration_path)
     input_action = center_action()
     processed = processor((input_action, {}))
@@ -58,6 +61,7 @@ def test_complete_action_passes_teleop_pipeline(calibration_path: Path) -> None:
 
 
 def test_f4_violation_rejected_before_output(calibration_path: Path) -> None:
+    """F4の範囲外指令はパイプライン出力前にGuardRejectedErrorになり、理由に軸名が残ることを確認する。"""
     processor = make_guarded_teleop_pipeline(calibration_path)
     action = center_action()
     action["wrist_flex.pos"] = -110.0
@@ -66,7 +70,10 @@ def test_f4_violation_rejected_before_output(calibration_path: Path) -> None:
 
 
 def test_saved_action_and_robot_action_identity_path_match(calibration_path: Path) -> None:
-    """record_loop 内の 2 段階の加工を再現する。実機への送信は行わない。"""
+    """手動操作側の検査とロボット側の恒等加工を順に通しても指令が一致することを確認する。
+
+    record_loopの2段階加工を再現し、送信候補と記録側で扱う値の対応を見る。実機送信はしない。
+    """
     teleop_action_processor = make_guarded_teleop_pipeline(calibration_path)
     robot_action_processor = make_default_robot_action_processor()
     original = center_action()
@@ -78,6 +85,7 @@ def test_saved_action_and_robot_action_identity_path_match(calibration_path: Pat
 
 
 def test_step_does_not_mutate_input(calibration_path: Path) -> None:
+    """パイプラインが入力辞書を変更せず、先頭に範囲検査ステップを持つことを確認する。"""
     processor = make_guarded_teleop_pipeline(calibration_path)
     action = center_action()
     old = dict(action)

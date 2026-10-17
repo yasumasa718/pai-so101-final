@@ -1,4 +1,9 @@
-"""K20Proから静止画を1枚保存する。既定はMJPG・640×480・30 fps・フォーカス230。"""
+"""K20Proから静止画を1枚保存する。既定はMJPG・640×480・30 fps・フォーカス230。
+
+単独で撮影状態を確認するためのCLI。DiagnosticCameraに設定照合とPNG保存を任せ、
+撮影後はカメラを解放する。画像認識から試したい場合は、保存画像を
+detect_objectsの入力に渡せる。ロボットへの接続や指令送信は行わない。
+"""
 
 import argparse
 import sys
@@ -12,6 +17,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def main(argv=None) -> int:
+    """引数を読み、新規フォルダーへ1枚保存する。成功は0、撮影・保存先の異常は1。
+
+    argv=Noneならコマンドライン引数を使う。テストでは引数のリストを渡せる。
+    起動直後の60フレームを読み捨てた後の画像を保存する。
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="/dev/video0", help="カメラのデバイス")
     parser.add_argument("--focus", type=int, default=230, help="手動フォーカス（既定: 230）")
@@ -26,11 +36,13 @@ def main(argv=None) -> int:
         warmup_frames=60, max_read_s=1,
     )
     try:
+        # 既存の撮影結果と混ざらないよう、同名の保存先があればここで終了する。
         image_dir.mkdir(parents=True, exist_ok=False)
         try:
             camera.open()
             image = camera.capture(0)
         finally:
+            # open()の途中やcapture()で失敗した場合もデバイスの解放を試みる。
             camera.close()
     except CameraDiagnosticError as exc:
         print(f"撮影失敗: {exc.stage} / {exc.cause_type} / {exc.details}", file=sys.stderr)

@@ -1,4 +1,8 @@
-"""複数フレームのエピソード管理をオフラインで検証する。モーターやカメラは操作しない。"""
+"""複数フレームの開始・記録・明示保存・中断・終了の状態遷移を検証する。
+
+前半はメモリ上のFakeDataset、後半は一時ディレクトリの実LeRobotDatasetを使う。
+送信は常にFakeRobotで行い、保存済みエピソードと失敗した未保存エピソードを区別する。
+"""
 from __future__ import annotations
 
 from collections.abc import Iterator
@@ -23,10 +27,12 @@ JOINTS = tuple(f"{name}.pos" for name in MOTOR_IDS)
 
 
 def action(gripper: float = 50.0) -> dict[str, float]:
+    """腕0度と指定した爪位置からなる6軸指令を作る。"""
     return {name: (gripper if name == "gripper.pos" else 0.0) for name in JOINTS}
 
 
 def observation(*, camera: bool = False) -> dict[str, Any]:
+    """要求値と区別できる爪42の観測を作り、必要なら一定画素値32の画像を付ける。"""
     result: dict[str, Any] = action(42.0)
     if camera:
         result["top"] = np.full((2, 3, 3), 32, dtype=np.uint8)
@@ -34,6 +40,7 @@ def observation(*, camera: bool = False) -> dict[str, Any]:
 
 
 def features(*, camera: bool = False):
+    """6軸の指令・観測と、任意の小さなカメラ画像を持つ保存スキーマを作る。"""
     result = {
         "action": {"dtype": "float32", "shape": (6,), "names": list(JOINTS)},
         "observation.state": {"dtype": "float32", "shape": (6,), "names": list(JOINTS)},
@@ -48,6 +55,7 @@ def features(*, camera: bool = False):
 
 @dataclass
 class FakeRobot:
+    """送信を記録し、爪の戻り値制限や送信結果不明の例外を再現する。切断回数も監視する。"""
     sent: list[dict[str, float]] = field(default_factory=list)
     clip_to: float | None = None
     fail_send: bool = False
@@ -68,6 +76,7 @@ class FakeRobot:
 
 @dataclass
 class FakeDataset:
+    """保留フレームと保存済みエピソードを分け、追加・部分保存・終了の失敗を注入できる保存先。"""
     features: dict = field(default_factory=features)
     pending: list[dict] = field(default_factory=list)
     episodes: list[list[dict]] = field(default_factory=list)
@@ -101,11 +110,13 @@ class FakeDataset:
 
 
 def identity(value):
+    """指令をコピーして返す、観測も指令値も変えない加工処理。"""
     cmd, _obs = value
     return dict(cmd)
 
 
 def guard() -> ActionGuard:
+    """腕±100度・爪0〜100ポイントのテスト用範囲を作る。実機の推奨範囲ではない。"""
     return ActionGuard(tuple(
         JointBound(k, 0.0 if k == "gripper.pos" else -100.0,
                    100.0, "normalized_0_100" if k == "gripper.pos" else "degree")
@@ -114,6 +125,7 @@ def guard() -> ActionGuard:
 
 
 def build(*, robot=None, dataset=None, writer=None):
+    """未開始セッション・模擬ロボット・保存先を組み立てる。必要な部品だけ差し替えられる。"""
     bot = robot if robot is not None else FakeRobot()
     ds = dataset if dataset is not None else FakeDataset()
     out = writer if writer is not None else DatasetRecordWriter(ds, task="Pick crushed can")
@@ -122,6 +134,7 @@ def build(*, robot=None, dataset=None, writer=None):
 
 
 def test_constructor_requires_exact_writer_instance():
+    """セッションが観測を預けるwriterとループの保存コールバックが同一でなければ、構築を拒否することを確認する。"""
     session, robot, ds = build()
     loop = SafeRecordLoop(guard(), identity, identity, robot, lambda sent: None)
     with pytest.raises(ValueError, match="exact DatasetRecordWriter"):
@@ -130,6 +143,7 @@ def test_constructor_requires_exact_writer_instance():
 
 
 def test_cannot_record_before_start():
+    """開始前はフレームを記録できず、送信先も保存先も変更しないことを確認する。"""
     session, robot, ds = build()
     with pytest.raises(SessionStateError):
         session.record_frame(action(), observation())
@@ -137,6 +151,7 @@ def test_cannot_record_before_start():
 
 
 def test_two_frames_then_explicit_commit_and_finalize():
+    """2フレームは保留状態に置き、明示保存で1エピソードにしてから正常終了できることを確認する。"""
     session, robot, ds = build()
     session.start()
     a = session.record_frame(action(50), observation())
@@ -157,6 +172,7 @@ def test_two_frames_then_explicit_commit_and_finalize():
 
 
 def test_returns_clipped_target_for_dataset_not_original():
+    """要求した爪90ではなく送信先が返した47をデータセットに保存することを確認する。"""
     session, robot, ds = build(robot=FakeRobot(clip_to=47.0))
     session.start()
     session.record_frame(action(90), observation())
@@ -166,6 +182,7 @@ def test_returns_clipped_target_for_dataset_not_original():
 
 
 def test_invalid_observation_prevents_any_send_and_latches_fault():
+    """観測のNaNで送信前に両層をFAULTとし、再記録を拒否しつつ明示破棄・終了はできることを確認する。"""
     session, robot, ds = build()
     session.start()
     obs = observation()
@@ -184,6 +201,7 @@ def test_invalid_observation_prevents_any_send_and_latches_fault():
 
 
 def test_raw_f4_violation_aborts_entire_buffer_not_just_bad_frame():
+    """2フレーム目の範囲違反後はエピソード保存を禁止し、明示破棄で先の正常フレームを含む未保存分全体を捨てることを確認する。"""
     session, robot, ds = build()
     session.start()
     session.record_frame(action(), observation())
@@ -203,6 +221,7 @@ def test_raw_f4_violation_aborts_entire_buffer_not_just_bad_frame():
 
 
 def test_serial_exception_is_uncertain_and_no_commit():
+    """送信例外を結果不明として保持し、失敗フレームを保存せず、破棄・終了でも自動切断しないことを確認する。"""
     session, robot, ds = build(robot=FakeRobot(fail_send=True))
     session.start()
     with pytest.raises(RecordFault):
@@ -216,6 +235,7 @@ def test_serial_exception_is_uncertain_and_no_commit():
 
 
 def test_add_frame_error_latches_fault_after_send_then_discards_buffer():
+    """送信済みの後にフレーム追加が部分失敗した場合、RETURNEDを残し、明示破棄で保留データを消すことを確認する。"""
     session, robot, ds = build(dataset=FakeDataset(fail_add=True))
     session.start()
     with pytest.raises(RecordFault):
@@ -229,6 +249,7 @@ def test_add_frame_error_latches_fault_after_send_then_discards_buffer():
 
 
 def test_manual_abort_discards_all_and_blocks_reuse():
+    """手動中断で保留フレーム全体を捨て、同じセッションでの再収録・保存を拒否することを確認する。"""
     session, robot, ds = build()
     session.start()
     session.record_frame(action(), observation())
@@ -244,6 +265,7 @@ def test_manual_abort_discards_all_and_blocks_reuse():
 
 
 def test_empty_episode_not_committed_and_can_still_record():
+    """空エピソードの保存要求だけではFAULTにせず、拒否後もフレームを追加して保存できることを確認する。"""
     session, robot, ds = build()
     session.start()
     with pytest.raises(SessionStateError, match="empty"):
@@ -255,6 +277,7 @@ def test_empty_episode_not_committed_and_can_still_record():
 
 
 def test_save_exception_quarantines_no_rollback():
+    """部分保存後の例外では保存結果不明を保持し、破棄や終了を禁止して元に戻せたと扱わないことを確認する。"""
     session, robot, ds = build(dataset=FakeDataset(fail_save=True))
     session.start()
     session.record_frame(action(), observation())
@@ -272,6 +295,7 @@ def test_save_exception_quarantines_no_rollback():
 
 
 def test_second_episode_can_use_same_dataset_writer_with_fresh_loop():
+    """正常保存後はwriterを共有しつつループとセッションを新しくし、2つ目のエピソードを保存できることを確認する。"""
     session, robot, ds = build()
     writer = session.writer
     session.start()
@@ -289,6 +313,7 @@ def test_second_episode_can_use_same_dataset_writer_with_fresh_loop():
 
 
 def test_image_staged_and_copied_before_send():
+    """フレーム処理後に呼出し側の画像を変更しても、預けた画像のコピーが保存先に残ることを確認する。"""
     ds = FakeDataset(features=features(camera=True))
     session, robot, _ = build(dataset=ds)
     obs = observation(camera=True)
@@ -301,6 +326,7 @@ def test_image_staged_and_copied_before_send():
 
 
 def test_dataset_observation_can_be_supplied_separately():
+    """制御へ渡す観測とは別の保存用観測を指定した場合、保存側には指定した爪37が渡ることを確認する。"""
     session, robot, ds = build()
     session.start()
     separate = observation()
@@ -310,6 +336,7 @@ def test_dataset_observation_can_be_supplied_separately():
 
 
 def test_finalization_error_latches_fault_and_no_disconnect():
+    """終了処理失敗でもFAULTと保存結果不明を保持し、ロボットの切断を勝手に呼ばないことを確認する。"""
     ds = FakeDataset(fail_finalize=True)
     session, robot, _ = build(dataset=ds)
     session.start()
@@ -323,6 +350,7 @@ def test_finalization_error_latches_fault_and_no_disconnect():
 
 
 def test_normal_session_cannot_restart_or_abort_after_save():
+    """保存済みセッションの再開始・破棄を拒否し、確定済みデータを消さないことを確認する。"""
     session, robot, ds = build()
     session.start()
     session.record_frame(action(), observation())
@@ -346,6 +374,7 @@ def follower_guard() -> ActionGuard:
 
 @pytest.fixture
 def real_dataset(tmp_path: Path) -> Iterator[Any]:
+    """指令だけ関節順を反転した実Datasetを一時作成し、テスト終了時に保持しておいたfinalizeで資源を閉じる。"""
     pytest.importorskip("lerobot")
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -366,11 +395,13 @@ def real_dataset(tmp_path: Path) -> Iterator[Any]:
 
 
 def real_session(ds: Any, gate: ActionGuard, robot: FakeRobot, writer: DatasetRecordWriter | None = None) -> SafeRecordSession:
+    """実Datasetと検査器へ模擬ロボットを接続し、必要なら既存writerを再利用するセッションを作る。"""
     output = writer if writer is not None else DatasetRecordWriter(ds, "Pick crushed can")
     return SafeRecordSession(SafeRecordLoop(gate, identity, identity, robot, output), output)
 
 
 def read_frames(ds: Any) -> Any:
+    """保存先配下の全Parquetを読み、ファイル順に連結したテーブルを返す。"""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -380,7 +411,7 @@ def read_frames(ds: Any) -> Any:
 
 
 def test_true_lerobot_dataset_roundtrip_without_hardware(real_dataset: Any, follower_guard: ActionGuard) -> None:
-    """実際のデータセットに 2 エピソードを保存し、全フレームの戻り値の指令と観測値を比べる。"""
+    """実Datasetへ2エピソード・計6フレームを保存し、送信戻り値・観測・単位配列順・番号・時刻・メタデータを読み戻して確認する。"""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -436,6 +467,7 @@ def test_true_lerobot_dataset_roundtrip_without_hardware(real_dataset: Any, foll
 def test_real_dataset_discards_fault_episode_preserving_saved_episode(
     real_dataset: Any, follower_guard: ActionGuard, failure: str,
 ) -> None:
+    """範囲違反・加工後違反・送信失敗・手動中断の各経路で、未保存エピソードだけを破棄し、先の保存済み1件を残すことを確認する。"""
     ds = real_dataset
     robot = FakeRobot()
     saved = real_session(ds, follower_guard, robot)
@@ -497,7 +529,7 @@ def test_real_dataset_discards_fault_episode_preserving_saved_episode(
 def test_real_dataset_save_failure_keeps_uncertainty_and_forbids_retry(
     real_dataset: Any, follower_guard: ActionGuard, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """実際に保存した後で失敗した場合に、保存前の状態に戻せたと誤って扱わないことを確認する。"""
+    """実際の保存が完了した直後に例外を出し、呼出し側では成功と断定せず、再保存・破棄・終了・追加送信を禁止することを確認する。"""
     ds = real_dataset
     robot = FakeRobot()
     session = real_session(ds, follower_guard, robot)
@@ -509,6 +541,7 @@ def test_real_dataset_save_failure_keeps_uncertainty_and_forbids_retry(
     def fail_after_save(*args: Any, **kwargs: Any) -> None:
         nonlocal save_calls
         save_calls += 1
+        # 先に本物の保存を完了させることで、「例外なら何も保存されていない」という誤解を検出する。
         real_save(*args, **kwargs)
         raise OSError("failure after real episode persistence")
 
@@ -540,6 +573,7 @@ def test_real_dataset_save_failure_keeps_uncertainty_and_forbids_retry(
 
 
 def test_session_preserves_uncertain_send_on_keyboard_interrupt() -> None:
+    """送信中断時の段階・フレーム番号・UNCERTAINをループからセッションへ引き継ぎ、再送や保存を禁止することを確認する。"""
     class InterruptedRobot(FakeRobot):
         def send_action(self, requested: dict[str, float]) -> dict[str, float]:
             self.sent.append(dict(requested))

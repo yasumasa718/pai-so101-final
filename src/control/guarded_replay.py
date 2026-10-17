@@ -30,6 +30,8 @@ from src.control.timed_observation import JointReadError, TimedJointReader
 
 ROOT = Path(__file__).resolve().parents[2]
 PHASES = ("approach", "grasp", "box", "release", "retreat")
+# 周期・待機時間は秒。姿勢許容差は腕が度、爪が0〜100のポイント。
+# 全経路を順に送り、指定した5要所の目標を送るたびに追加の到達待ちを行う。
 PERIOD = 0.1
 START_TOLERANCE = 2.0
 ARM_TOLERANCE = 3.0
@@ -43,6 +45,7 @@ JOINT_LABELS = {
 
 
 def checked(action, guard):
+    """6軸の位置を検査してコピーを返す。拒否理由は準備段階のValueErrorとして伝える。"""
     result = guard.check(action)
     if not result.accepted:
         raise ValueError("Invalid replay position: " + "; ".join(result.reasons))
@@ -50,7 +53,15 @@ def checked(action, guard):
 
 
 def prepare(args):
-    """同じ入力バイト列を照合・解析。接続前に全フレームを検査し、制限内の指令へ分割する。"""
+    """入力を照合し、(校正辞書, 範囲検査器, 再生計画)を返す。実機には接続しない。
+
+    source_logは正常終了したテレオペJSONL、checkpointsはreview_teleopが抽出した
+    5要所のJSON。同じバイト列でハッシュ照合と解析を行い、要所の値も元ログと比較する。
+    親から期待ハッシュを渡された場合、子で入力が変わっていれば再生を拒否する。
+
+    全フレームの送信目標を制限内の小さな指令へ分割し、plan['steps']へ格納する。
+    分割した最後の指令だけを元フレームの完了とし、該当する要所の到達待ちを付ける。
+    """
     calibration, guard = load_calibration(args.calibration, args.expected_sha256)
     source = args.source_log.read_bytes()
     checkpoints = args.checkpoints.read_bytes()
@@ -96,6 +107,7 @@ def prepare(args):
         previous_time = frame["read_started_at"]
         while True:
             target = checked(limited_target(desired, previous, calibration, PERIOD, policy), guard)
+            # 浮動小数点の誤差ではなく、モーターへ送る整数tickが一致したかで分割を終える。
             reached = raw_from_positions(target, calibration) == raw_from_positions(desired, calibration)
             steps.append({"source_frame": frame["index"], "period_s": interval,
                           "target": target, "source_frame_complete": reached,
@@ -125,6 +137,11 @@ def prepare(args):
 
 
 def check_start(current, plan, stream, *, require_match=True):
+    """初期姿勢との差を表示・記録し、全軸が許容差内かを返す。
+
+    require_match=Trueなら不一致をValueErrorにする。手動で姿勢を合わせる表示では
+    Falseを指定し、不一致でも観測を続ける。ここから位置指令は送らない。
+    """
     differences = {key: current[key]-expected for key, expected in plan["initial"].items()}
     matches = all(abs(delta) <= START_TOLERANCE for delta in differences.values())
     emit(stream, "start_check", expected=plan["initial"], observation=current,
@@ -170,6 +187,13 @@ def watch_start(reader, initial, plan, stream, duration_s):
 
 
 class ReplayRunner:
+    """1回の再生の送信履歴と期限を保持し、周期送信と要所の到達待ちを行う。
+
+    最初にsend()で現在位置の保持目標を送ってからtick()を使う。
+    target_reachedは「その目標を送信できたか」であり、実測位置の到達とは別。
+    実測値の判定はwait_checkpoint()で行う。接続・トルク操作は呼出し側が担当する。
+    """
+
     def __init__(self, reader, raw_reader, sender, guard, stream, deadline):
         self.reader, self.raw_reader, self.stream = reader, raw_reader, stream
         self.deadline = deadline
@@ -184,6 +208,7 @@ class ReplayRunner:
         self.loop.start()
 
     def send(self, target, observed):
+        """時刻付き観測で指令を検査・送信し、返された目標と戻り時刻を次回の基準にする。"""
         result = self.loop.process_frame(target, observed.as_observation(),
                                          observation_time=observed.read_started_at,
                                          observation_end_time=observed.read_completed_at)
@@ -191,6 +216,11 @@ class ReplayRunner:
         return result
 
     def tick(self, step, *, waiting=False, deadline=None):
+        """1周期待ち、観測→変化制限→送信→記録を行って、送信前の実測位置を返す。
+
+        deadlineを渡すと全体期限との早い方を使う。waitingは要所の保持送信を示す
+        ログ用フラグで、保持中も通常と同じ観測・指令検査を通す。
+        """
         limit = min(self.deadline, deadline if deadline is not None else self.deadline)
         if time.monotonic()+step["period_s"] >= limit:
             raise TimeoutError("Replay / checkpoint time limit exceeded")
@@ -212,6 +242,12 @@ class ReplayRunner:
         return observed.as_observation()
 
     def wait_checkpoint(self, step):
+        """要所の目標を保持し、実測位置が2回連続で許容差内になるまで待つ。
+
+        graspでは連続一致後もGRASP_DWELL秒保持する。grasp/boxでは缶が爪の閉動作を
+        妨げるため爪の位置一致を要求しない。条件成立は把持成功の自動検出ではない。
+        制限時間内に到達しなければtick()からTimeoutErrorが伝わる。
+        """
         phase = step["checkpoint"]
         print(f"到達待ち：{phase}（最大{WAIT_TIMEOUT:g}秒）。", file=sys.stderr, flush=True)
         emit(self.stream, "checkpoint_wait", name=phase, source_frame=step["source_frame"])
@@ -243,10 +279,17 @@ class ReplayRunner:
 
 
 def runtime_budget(plan):
+    """計画上の移動時間に5要所の最大待機と10秒の余裕を加え、全体期限の秒数を返す。"""
     return plan["nominal_motion_s"]+len(PHASES)*WAIT_TIMEOUT+10
 
 
 def run_worker(args, stream, *, activation_deadline=None):
+    """開始姿勢の照合または固定再生を行い、終了時に有効化を試みた軸を解除する。
+
+    activation_deadlineは認識画像の有効期限を表す単調時計の絶対時刻。
+    指定時は動作準備前とトルク有効化前に確認する。再生中の期限は別に管理する。
+    戻り値は正常終了0、異常1。正常終了でも物体の把持・投入成否は保証しない。
+    """
     bus = None
     enabled = []
     failed = False
@@ -284,6 +327,7 @@ def run_worker(args, stream, *, activation_deadline=None):
             runner = ReplayRunner(reader, raw_reader, FollowerSender(bus, calibration), guard,
                                   stream, time.monotonic()+runtime_budget(plan))
             stage = "prepare_hold"
+            # トルクON時に以前のGoal_Positionへ動き出さないよう、現在位置で上書き・照合する。
             time.sleep(0.01)
             runner.send(initial.as_observation(), initial)
             for motor, value in raw_reader.raw.items():
@@ -293,6 +337,7 @@ def run_worker(args, stream, *, activation_deadline=None):
             if activation_deadline is not None and time.monotonic() >= activation_deadline:
                 raise TimeoutError("Recognition image expired before torque enable")
             for motor in MOTOR_IDS:
+                # 書込み応答だけ失われる場合もあるため、成功確認より先に解除対象へ加える。
                 enabled.append(motor)
                 bus.write("Torque_Enable", motor, 1, normalize=False, num_retry=0)
                 if bus.read("Torque_Enable", motor, normalize=False, num_retry=0) != 1:
@@ -301,6 +346,7 @@ def run_worker(args, stream, *, activation_deadline=None):
                   file=sys.stderr, flush=True)
             for step in plan["steps"]:
                 stage = "replay"
+                # 実行時の変化制限で目標に届かない場合も、元経路の点を飛ばさず送信を続ける。
                 while True:
                     runner.tick(step)
                     if runner.target_reached:
@@ -349,6 +395,11 @@ def run_worker(args, stream, *, activation_deadline=None):
 
 
 def main(argv=None):
+    """既定では計画JSONだけを保存するCLI。実機モードは期限付きの子プロセスで動かす。
+
+    --check-startは一度の照合、--watch-startは手動調整用の継続表示、
+    --executeは固定再生。これらは排他的で、読取りモードでは目標・トルクを書かない。
+    """
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--source-log", type=Path, required=True)
     cli.add_argument("--checkpoints", type=Path, required=True)

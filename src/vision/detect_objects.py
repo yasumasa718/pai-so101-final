@@ -1,4 +1,9 @@
-"""保存画像のOWLv2認識と、任意のROIによる対象候補の判定。"""
+"""保存画像のOWLv2認識と、任意のROIによる対象候補の判定。
+
+テキストで指定した対象を検出し、検出枠付き画像と検出一覧を保存する。
+ROI（画像上の矩形領域）を指定した場合はvalidate_detectionsで候補数も判定する。
+統合処理recognize_and_replayからも利用されるが、このモジュール自体は実機を動かさない。
+"""
 
 import argparse
 import json
@@ -25,6 +30,11 @@ INPUT_PATH = ROOT / "outputs/ai_demo/input.jpg"
 
 
 def load_detector():
+    """OWLv2推論用のpipelineを作る。CUDAが使えればGPU 0、それ以外はCPUを使う。
+
+    重いライブラリのimportとモデル読込みは呼出し時まで遅らせる。
+    初回はモデルの取得が発生し得るため、統合処理では撮影より先に呼ぶ。
+    """
     import torch
     from transformers import pipeline
 
@@ -41,7 +51,16 @@ def load_detector():
 
 
 def detect_image(image_path, output_dir, roi=None, min_score=THRESHOLD, *, detector=None):
-    """モデルを渡せば読み込みを再利用できる。画像認識・保存だけを行い、判定を返す。"""
+    """1枚を認識して結果を保存し、ROI指定時は判定辞書、省略時はNoneを返す。
+
+    image_pathは入力画像、output_dirは保存先のPath。min_scoreは推論と
+    ROI候補判定で共通に使うスコア閾値。detectorには読込み済みモデルや
+    テスト用の呼出し可能オブジェクトを渡せ、省略するとここでモデルを作る。
+
+    detected.jpgとdetections.jsonを保存し、ROIがあればdetection_gate.jsonも作る。
+    同名の出力ファイルは上書きするため、実行ごとに保存先を分けるのは呼出し側の責務。
+    画像読込み・推論・検査・保存の例外は呼出し側へ伝える。
+    """
     with Image.open(image_path) as source:
         image = source.convert("RGB")
     if roi is not None:
@@ -50,7 +69,8 @@ def detect_image(image_path, output_dir, roi=None, min_score=THRESHOLD, *, detec
     if detector is None:
         detector = load_detector()
 
-    # AI推論
+    # 画像内を探索する対象はTARGETSのテキスト。ROIで画像を切り抜く処理ではなく、
+    # 全画像の検出結果から後段でROI内の候補を数える。
     results = detector(
         image,
         candidate_labels=TARGETS,
@@ -68,7 +88,8 @@ def detect_image(image_path, output_dir, roi=None, min_score=THRESHOLD, *, detec
         label = result["label"]
         score = float(result["score"])
 
-        # JSON保存用のデータ
+        # モデルの出力をJSONで扱える通常の数値にそろえる。
+        # 後段の候補判定には、この整数化した検出枠を渡す。
         detection = {
             "label": label,
             "score": score,
@@ -139,6 +160,7 @@ def detect_image(image_path, output_dir, roi=None, min_score=THRESHOLD, *, detec
 
 
 def main(argv=None) -> int:
+    """保存画像を認識するCLI。正常終了の0は、ロボットの実行許可を意味しない。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", type=Path, default=INPUT_PATH, help="入力画像")
     parser.add_argument("--output-dir", type=Path, help="保存先（省略時は日時付きフォルダー）")

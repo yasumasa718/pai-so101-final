@@ -1,4 +1,8 @@
-"""実機には接続せず、F6限定の書込み順序と失敗時の解除を確認する。"""
+"""実機へ接続せず、F6限定の書込み順序・開始拒否・失敗時の解除を検証する。
+
+GripperBusは目標とトルクをメモリで保持し、書込みが適用された後の応答喪失も再現する。
+腕5軸へ書き込むと模擬バスのassertで失敗するため、操作対象の限定も検査できる。
+"""
 
 import io
 
@@ -9,6 +13,7 @@ from test_diagnose_observation import ReadOnlyBus, hardware_args, records
 
 
 class GripperBus(ReadOnlyBus):
+    """F6だけの読取り・位置指令・トルク操作を模擬し、全書込みを順序付きで記録する。"""
     def __init__(self):
         super().__init__()
         self.torque = {name: 0 for name in self.calibration}
@@ -36,6 +41,7 @@ class GripperBus(ReadOnlyBus):
         return values
 
     def write(self, register, motor, value, *, normalize, num_retry):
+        """爪だけの書込みを受け付け、指定時は適用後に例外を出して「届いたが応答なし」を再現する。"""
         assert motor == "gripper"
         assert register in ("Goal_Position", "Torque_Enable")
         assert not normalize and num_retry == 0
@@ -54,6 +60,7 @@ class GripperBus(ReadOnlyBus):
 
 
 def run(tmp_path, monkeypatch, bus, execute=True):
+    """バスと待機を差し替えて単発テストの子側処理を実行し、終了コードとログを返す。"""
     args = hardware_args(tmp_path)
     args.execute = execute
     monkeypatch.setattr(gripper, "make_hardware_bus", lambda *args: bus)
@@ -65,6 +72,7 @@ def run(tmp_path, monkeypatch, bus, execute=True):
 
 @pytest.mark.parametrize("execute", [False, True])
 def test_preview_or_single_open_and_f6_only_cleanup(tmp_path, monkeypatch, execute):
+    """読取り専用では書かず、実行時は現在値保持→ON→小さな開き→OFFの順でF6だけを操作することを確認する。"""
     bus = GripperBus()
     status, events = run(tmp_path, monkeypatch, bus, execute)
     assert status == 0
@@ -81,6 +89,7 @@ def test_preview_or_single_open_and_f6_only_cleanup(tmp_path, monkeypatch, execu
 
 
 def test_active_arm_refuses_without_any_writes(tmp_path, monkeypatch):
+    """開始時に腕の1軸でもトルクONなら、書込みせずレジスタ検査で失敗することを確認する。"""
     bus = GripperBus()
     bus.torque["shoulder_lift"] = 1
     status, events = run(tmp_path, monkeypatch, bus)
@@ -90,6 +99,7 @@ def test_active_arm_refuses_without_any_writes(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("raw", [2034, 3475])
 def test_invalid_initial_or_target_refuses_before_writes(tmp_path, monkeypatch, raw):
+    """現在位置または開き目標が校正範囲外になる場合、書込み前に拒否することを確認する。"""
     bus = GripperBus()
     bus.position = raw
     status, events = run(tmp_path, monkeypatch, bus)
@@ -99,6 +109,7 @@ def test_invalid_initial_or_target_refuses_before_writes(tmp_path, monkeypatch, 
 
 @pytest.mark.parametrize("failed_write", [("Torque_Enable", 1), ("Goal_Position", 2128), ("Torque_Enable", 0)])
 def test_uncertain_write_attempts_f6_off_once_and_never_retries(tmp_path, monkeypatch, failed_write):
+    """ON・目標送信・OFFの応答を失っても再送せず、F6解除を試み、正常完了と報告しないことを確認する。"""
     bus = GripperBus()
     bus.fail_write = failed_write
     status, events = run(tmp_path, monkeypatch, bus)
@@ -112,6 +123,7 @@ def test_uncertain_write_attempts_f6_off_once_and_never_retries(tmp_path, monkey
 
 
 def test_goal_mismatch_never_enables_torque(tmp_path, monkeypatch):
+    """現在位置を目標へ書いた後の読戻しが一致しなければ、トルクONへ進まないことを確認する。"""
     bus = GripperBus()
     bus.bad_goal_readback = True
     status, events = run(tmp_path, monkeypatch, bus)

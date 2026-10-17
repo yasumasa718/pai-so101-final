@@ -1,6 +1,7 @@
-"""1 フレームの収録処理を Fake Robot だけで検証する。
+"""1フレームの検査→加工→送信→記録の順序と、FAULT後の停止を検証する。
 
-ロボット、シリアル通信、カメラ、実際の LeRobotDataset、トルク操作は使わない。
+FakeRobotとリスト保存先を使い、実機・カメラ・LeRobotDatasetは使わない。
+送信前の拒否、送信結果不明、送信後の記録失敗を区別することが主な確認点。
 """
 
 from __future__ import annotations
@@ -23,11 +24,13 @@ from src.control.safe_record_loop import (
 
 
 def center_action() -> dict[str, float]:
+    """腕0度・爪50ポイントの、正常な6軸指令を作る。"""
     return {f"{name}.pos": (50.0 if name == "gripper" else 0.0) for name in MOTOR_IDS}
 
 
 @pytest.fixture
 def guard(tmp_path: Path) -> ActionGuard:
+    """一時的な校正JSONから、各テスト共通の範囲検査器を作る。"""
     ranges = {
         "shoulder_pan": (792, 3306),
         "shoulder_lift": (826, 3209),
@@ -53,6 +56,7 @@ def guard(tmp_path: Path) -> ActionGuard:
 
 @dataclass
 class FakeRobot:
+    """送信履歴を残し、爪の制限・送信例外・範囲外戻り値を再現する送信先。"""
     sent_calls: list[dict[str, float]] = field(default_factory=list)
     disconnect_calls: int = 0
     clip_gripper_to: float | None = None
@@ -75,12 +79,14 @@ class FakeRobot:
 
 
 def identity(payload: tuple[dict[str, float], dict[str, Any]]) -> dict[str, float]:
+    """(指令, 観測)から指令だけをコピーして返す、値を変えない加工処理。"""
     action, _obs = payload
     return dict(action)
 
 
 @pytest.fixture
 def context(guard: ActionGuard):
+    """未開始のループ・模擬送信先・保存リストを一組で作る。"""
     robot = FakeRobot()
     saved: list[dict[str, float]] = []
     controller = SafeRecordLoop(
@@ -94,6 +100,7 @@ def context(guard: ActionGuard):
 
 
 def test_not_started_cannot_send(context):
+    """start前のフレーム処理は状態エラーになり、送信も保存もしないことを確認する。"""
     controller, robot, saved = context
     with pytest.raises(RecordStateError):
         controller.process_frame(center_action(), {})
@@ -102,6 +109,7 @@ def test_not_started_cannot_send(context):
 
 
 def test_valid_frame_is_sent_and_saved(context):
+    """正常な1フレームを1回送信・保存し、0始まりの番号と正常終了状態が得られることを確認する。"""
     controller, robot, saved = context
     controller.start()
     result = controller.process_frame(center_action(), {})
@@ -114,6 +122,7 @@ def test_valid_frame_is_sent_and_saved(context):
 
 
 def test_clip_records_returned_command_not_requested(guard):
+    """要求した爪50ではなく、送信側が制限して返した47を保存し、処理結果でも両者を区別することを確認する。"""
     robot = FakeRobot(clip_gripper_to=47.0)
     saved: list[dict[str, float]] = []
     loop = SafeRecordLoop(guard, identity, identity, robot, lambda action: saved.append(dict(action)))
@@ -131,6 +140,7 @@ def test_clip_records_returned_command_not_requested(guard):
     ("elbow_flex.pos", float("nan")),
 ])
 def test_raw_violation_rejected_before_any_send(context, joint, bad):
+    """元の入力指令の範囲外・NaNを最初の検査で拒否し、未送信としてFAULTを保持することを確認する。"""
     controller, robot, saved = context
     controller.start()
     action = center_action()
@@ -145,6 +155,7 @@ def test_raw_violation_rejected_before_any_send(context, joint, bad):
 
 
 def test_missing_joint_fails_closed(context):
+    """欠けた軸を補完せず拒否し、送信・保存を行わないことを確認する。"""
     controller, robot, saved = context
     controller.start()
     action = center_action()
@@ -156,6 +167,7 @@ def test_missing_joint_fails_closed(context):
 
 @pytest.mark.parametrize("stage", ["teleop", "robot"])
 def test_processor_modified_command_is_rechecked(guard, stage):
+    """手動操作側・ロボット側のどちらの加工で範囲外になっても、送信前に再検査して拒否することを確認する。"""
     robot = FakeRobot()
     saved: list[dict[str, float]] = []
 
@@ -181,6 +193,7 @@ def test_processor_modified_command_is_rechecked(guard, stage):
 
 
 def test_send_failure_marks_uncertain_and_never_saves(guard):
+    """送信中の例外は届かなかったと断定せずUNCERTAINとし、保存や自動切断を行わないことを確認する。"""
     robot = FakeRobot(fail_during_send=True)
     saved: list[dict[str, float]] = []
     loop = SafeRecordLoop(guard, identity, identity, robot, lambda action: saved.append(dict(action)))
@@ -196,6 +209,7 @@ def test_send_failure_marks_uncertain_and_never_saves(guard):
 
 
 def test_bad_send_return_latches_fault_after_send_without_saving(guard):
+    """送信戻り値が範囲外なら、送信済み1回という事実を保持しつつ保存を防ぐことを確認する。"""
     robot = FakeRobot(return_out_of_bounds=True)
     saved: list[dict[str, float]] = []
     loop = SafeRecordLoop(guard, identity, identity, robot, lambda action: saved.append(dict(action)))
@@ -209,6 +223,7 @@ def test_bad_send_return_latches_fault_after_send_without_saving(guard):
 
 
 def test_writer_failure_after_send_faults_and_does_not_retry(guard):
+    """送信後の保存失敗ではフレーム数を増やさず、次回の処理や再送を拒否することを確認する。"""
     robot = FakeRobot()
 
     def bad_writer(_action):
@@ -228,6 +243,7 @@ def test_writer_failure_after_send_faults_and_does_not_retry(guard):
 
 
 def test_fault_is_latched_and_never_disconnects_automatically(context):
+    """FAULT後は処理・再開始・正常終了を拒否し、ループ自身では切断しないことを確認する。"""
     loop, robot, saved = context
     loop.start()
     action = center_action()
@@ -243,6 +259,7 @@ def test_fault_is_latched_and_never_disconnects_automatically(context):
 
 
 def test_keyboard_interrupt_latches_fault_without_automatic_disconnect(guard):
+    """送信中のKeyboardInterruptも送信結果不明として保持し、割込みを再送せず呼出し側へ伝えることを確認する。"""
     class InterruptedRobot(FakeRobot):
         def send_action(self, action):
             self.sent_calls.append(dict(action))
@@ -263,7 +280,7 @@ def test_keyboard_interrupt_latches_fault_without_automatic_disconnect(guard):
 
 
 def test_real_guarded_teleop_pipeline_compatible(guard, tmp_path: Path):
-    """LeRobot が入った環境で、既存の指令加工処理と組み合わせて確認する。"""
+    """実際のLeRobot加工パイプラインを模擬送信先へつなぎ、正常な指令を1フレーム保存できることを確認する。"""
     pytest.importorskip("lerobot")
     from src.control.guarded_record_processor import make_guarded_teleop_pipeline
     from lerobot.processor import make_default_robot_action_processor

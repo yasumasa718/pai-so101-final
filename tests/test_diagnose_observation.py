@@ -1,4 +1,8 @@
-"""実バス・カメラには接続せず、診断の読取り限定経路と監視を検証する。"""
+"""診断の読取り限定経路、設定照合、ログ、子プロセス監視を検証する。
+
+実バスには接続せずReadOnlyBusへ差し替える。一部はインストール済みLeRobotの
+接続処理をポートI/Oだけ模擬して検査し、監視テストは短命の実Python子プロセスを使う。
+"""
 
 import hashlib
 import io
@@ -19,10 +23,12 @@ SNAPSHOT = Path("configs/calibration_snapshots/my_follower_for_004.json")
 
 
 def records(text):
+    """JSONLの空行を除き、イベント辞書のリストへ変換する。他の制御テストでも共用する。"""
     return [json.loads(line) for line in text.splitlines() if line.strip()]
 
 
 def hardware_args(tmp_path):
+    """保存済み校正とテスト専用ポートを指定する引数を作る。実接続は呼出し側で模擬バスへ差し替える。"""
     return diagnostic.parser().parse_args([
         "--backend", "hardware", "--port", "/dev/serial/by-id/test-only",
         "--calibration", str(SNAPSHOT), "--expected-sha256", hashlib.sha256(SNAPSHOT.read_bytes()).hexdigest(),
@@ -31,6 +37,11 @@ def hardware_args(tmp_path):
 
 
 class ReadOnlyBus:
+    """読取り・接続・切断だけを許し、未知の操作は即テスト失敗にするバス代役。
+
+    正常な校正レジスタを返し、overrideや各error属性で不一致・通信失敗を注入できる。
+    Torque_Enableの既定値1は、診断が元のトルク状態を変えないことを確かめるための値。
+    """
     model_number_table = {"sts3215": 777}
 
     def __init__(self):
@@ -80,6 +91,7 @@ class ReadOnlyBus:
 
 
 def run_hardware_fake(monkeypatch, tmp_path, bus):
+    """実機モードのバス生成を差し替え、子側処理の終了コードとイベント列を返す。"""
     monkeypatch.setattr(diagnostic, "make_hardware_bus", lambda *args: bus)
     stream = io.StringIO()
     code = diagnostic.run_worker(hardware_args(tmp_path), stream)
@@ -87,6 +99,7 @@ def run_hardware_fake(monkeypatch, tmp_path, bus):
 
 
 def test_hardware_path_reads_checks_and_closes_without_writes(monkeypatch, tmp_path):
+    """実機モードの経路が設定照合と2回の取得を行い、トルクを変更せず切断することを模擬バスで確認する。"""
     bus = ReadOnlyBus()
     code, events = run_hardware_fake(monkeypatch, tmp_path, bus)
     assert code == 0
@@ -106,6 +119,7 @@ def test_hardware_path_reads_checks_and_closes_without_writes(monkeypatch, tmp_p
     ("Max_Position_Limit", -1), ("Operating_Mode", 1), ("Phase", 0x10), ("Torque_Enable", 2),
 ])
 def test_register_mismatch_prevents_samples_and_still_closes(monkeypatch, tmp_path, register, value):
+    """各レジスタの不一致で位置取得へ進まず、失敗した項目を記録して切断することを確認する。"""
     bus = ReadOnlyBus()
     bus.override[register] = value
     code, events = run_hardware_fake(monkeypatch, tmp_path, bus)
@@ -120,6 +134,7 @@ def test_register_mismatch_prevents_samples_and_still_closes(monkeypatch, tmp_pa
 
 @pytest.mark.parametrize("attribute,stage", [("connect_error", "bus_connect"), ("read_error", "joint_read")])
 def test_failure_closes_once_and_does_not_retry(monkeypatch, tmp_path, attribute, stage):
+    """接続・読取りの通信例外で再試行せず1回だけ切断し、秘密を含む例外本文をログへ出さないことを確認する。"""
     bus = ReadOnlyBus()
     setattr(bus, attribute, ConnectionError("SECRET_PORT"))
     code, events = run_hardware_fake(monkeypatch, tmp_path, bus)
@@ -132,6 +147,7 @@ def test_failure_closes_once_and_does_not_retry(monkeypatch, tmp_path, attribute
 
 
 def test_close_failure_preserves_original_fault(monkeypatch, tmp_path):
+    """読取り中断に加えて切断も失敗した場合、元の中断と切断失敗の両方がログに残ることを確認する。"""
     bus = ReadOnlyBus()
     bus.read_error = KeyboardInterrupt()
     bus.close_error = OSError()
@@ -143,6 +159,7 @@ def test_close_failure_preserves_original_fault(monkeypatch, tmp_path):
 
 
 def test_joint_range_failure_logs_reason_and_stops_without_retry(monkeypatch, tmp_path):
+    """範囲外のF4観測について値・許容範囲を記録し、再読取りや正常完了報告を行わないことを確認する。"""
     bus = ReadOnlyBus()
     original_read = bus.sync_read
 
@@ -164,6 +181,7 @@ def test_joint_range_failure_logs_reason_and_stops_without_retry(monkeypatch, tm
 
 
 def test_hash_failure_never_constructs_bus(monkeypatch, tmp_path):
+    """校正ハッシュが違えばバスを構築する前に失敗することを確認する。"""
     monkeypatch.setattr(diagnostic, "make_hardware_bus", lambda *args: pytest.fail("must not construct bus"))
     args = hardware_args(tmp_path)
     args.expected_sha256 = "0" * 64
@@ -173,10 +191,12 @@ def test_hash_failure_never_constructs_bus(monkeypatch, tmp_path):
 
 
 def test_log_failure_still_closes_without_torque_change(monkeypatch, tmp_path):
+    """観測もFAULTもログへ書けない場合でも、例外を伝える前にトルクを変えず切断することを確認する。"""
     bus = ReadOnlyBus()
     monkeypatch.setattr(diagnostic, "make_hardware_bus", lambda *args: bus)
 
     class BrokenLog(io.StringIO):
+        """観測行とFAULT行の書込みだけを失敗させ、記録用ディスクの異常を再現する。"""
         def write(self, text):
             if '"event": "observation"' in text or '"event": "fault"' in text:
                 raise OSError("disk full")
@@ -189,6 +209,7 @@ def test_log_failure_still_closes_without_torque_change(monkeypatch, tmp_path):
 
 
 def test_hardware_bus_uses_expected_units_and_never_opens_port():
+    """実ライブラリのバス構築で腕は度・爪は0〜100に設定され、構築だけではポートを開かないことを確認する。"""
     from lerobot.motors import MotorNormMode
     calibration, _ = diagnostic.load_calibration(SNAPSHOT, hashlib.sha256(SNAPSHOT.read_bytes()).hexdigest())
     bus = diagnostic.make_hardware_bus("/nonexistent/test-only", calibration)
@@ -199,6 +220,7 @@ def test_hardware_bus_uses_expected_units_and_never_opens_port():
 
 
 def test_installed_bus_connection_and_close_do_not_write_motor_registers(monkeypatch):
+    """実ライブラリの接続・切断を模擬ポートで通し、書込み・トルク操作・handshakeを呼ばないことを確認する。"""
     calibration, _ = diagnostic.load_calibration(SNAPSHOT, hashlib.sha256(SNAPSHOT.read_bytes()).hexdigest())
     bus = diagnostic.make_hardware_bus("/nonexistent/test-only", calibration)
     calls = []
@@ -222,6 +244,7 @@ def test_installed_bus_connection_and_close_do_not_write_motor_registers(monkeyp
 
 
 def test_fake_cli_completes_in_child_without_hardware(tmp_path):
+    """模擬CLIを実際の子プロセスで実行して2観測を保存し、同名ログへの再実行は上書きせず失敗することを確認する。"""
     output = tmp_path / "observations.jsonl"
     assert diagnostic.main(["--output", str(output), "--samples", "2", "--period-s", "0.001"]) == 0
     events = records(output.read_text())
@@ -238,6 +261,7 @@ def test_fake_cli_completes_in_child_without_hardware(tmp_path):
     ["--samples", "0"], ["--timeout-s", "nan"], ["--period-s", "-1"], ["--max-read-s", "0"],
 ])
 def test_invalid_cli_does_not_launch_or_create_log(monkeypatch, tmp_path, arguments):
+    """不足した実機指定や不正な取得条件を、子の起動・ログ作成より前に引数エラーとすることを確認する。"""
     monkeypatch.setattr(diagnostic, "supervise", lambda *args: pytest.fail("must not launch"))
     output = tmp_path / "missing.jsonl"
     with pytest.raises(SystemExit):
@@ -246,6 +270,7 @@ def test_invalid_cli_does_not_launch_or_create_log(monkeypatch, tmp_path, argume
 
 
 def test_supervisor_stops_a_real_hung_child(tmp_path):
+    """長時間sleepする実子プロセスを0.2秒の期限で停止し、終了コード124と停止確認ログを返すことを確認する。"""
     path = tmp_path / "hung.jsonl"
     start = time.monotonic()
     with path.open("w") as stream:
@@ -258,6 +283,7 @@ def test_supervisor_stops_a_real_hung_child(tmp_path):
 
 
 def test_supervisor_records_abnormal_exit(tmp_path):
+    """子の終了コード7を親では失敗1として返し、元の終了コードをログへ残すことを確認する。"""
     path = tmp_path / "crash.jsonl"
     with path.open("w") as stream:
         assert diagnostic.supervise([sys.executable, "-c", "raise SystemExit(7)"], stream, 3) == 1
@@ -265,6 +291,7 @@ def test_supervisor_records_abnormal_exit(tmp_path):
 
 
 def test_supervisor_interrupt_stops_child(monkeypatch, tmp_path):
+    """親のwaitへ1回だけ割込みを注入し、実子プロセスを停止して終了コード130を返すことを確認する。"""
     real_popen = diagnostic.subprocess.Popen
     processes = []
 
@@ -289,7 +316,9 @@ def test_supervisor_interrupt_stops_child(monkeypatch, tmp_path):
 
 
 def test_unstoppable_worker_is_not_reported_stopped():
+    """terminate・kill後も終了を確認できない模擬プロセスについて、停止成功と報告しないことを確認する。"""
     class Unstoppable:
+        """停止要求を無視し、常に生存中・待機期限切れを返すプロセス代役。"""
         def poll(self):
             return None
 

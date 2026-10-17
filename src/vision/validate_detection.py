@@ -1,7 +1,8 @@
-"""Validate a saved OWLv2 result without connecting to SO-101 hardware.
+"""保存済みのOWLv2検出結果を、実機へ接続せずに検査する。
 
-A recognition PASS is NOT an authorization to execute robot motion.
-The ROI is a camera-image heuristic, not a calibrated robot workspace.
+ラベル・スコア・検出枠の中心位置から候補数を数え、1件ならPASS、0件ならFAIL、
+複数ならREVIEWを返す。ROIは画像上の目安であり、校正済みのロボット作業範囲ではない。
+ここでのPASSは認識条件の成立だけを表し、実機の実行許可や把持成功を示さない。
 """
 
 from __future__ import annotations
@@ -18,6 +19,11 @@ from PIL import Image
 
 @dataclass(frozen=True)
 class ROI:
+    """画像左上を原点とする矩形。xは右向き、yは下向き、単位はピクセル。
+
+    作成だけでは画像サイズとの整合を検査しない。使用前にvalidate()を呼ぶ。
+    """
+
     xmin: int
     ymin: int
     xmax: int
@@ -25,6 +31,7 @@ class ROI:
 
     @classmethod
     def from_csv(cls, text: str) -> ROI:
+        """CLIのxmin,ymin,xmax,ymaxを整数4個へ変換する。不正な形式はValueError。"""
         try:
             values = [int(v.strip()) for v in text.split(",")]
         except ValueError as exc:
@@ -34,15 +41,18 @@ class ROI:
         return cls(*values)
 
     def validate(self, width: int, height: int) -> None:
+        """面積が正で画像内に収まることを検査する。座標の補正は行わない。"""
         if not (0 <= self.xmin < self.xmax <= width):
             raise ValueError(f"ROI x bounds must be within image width {width}")
         if not (0 <= self.ymin < self.ymax <= height):
             raise ValueError(f"ROI y bounds must be within image height {height}")
 
     def contains_center(self, x: float, y: float) -> bool:
+        """検出枠の中心が矩形の内部または境界上にあるかを返す。候補選択に使う。"""
         return self.xmin <= x <= self.xmax and self.ymin <= y <= self.ymax
 
     def contains_box(self, box: dict[str, float]) -> bool:
+        """検出枠全体の包含を返す。レポートの補足情報であり、候補選択の条件ではない。"""
         return (
             self.xmin <= box["xmin"]
             and box["xmax"] <= self.xmax
@@ -52,6 +62,7 @@ class ROI:
 
 
 def _finite_number(value: object) -> bool:
+    """JSONの数値として使えるint/floatかを判定する。boolやNaN・無限大は拒否する。"""
     return type(value) in (int, float) and math.isfinite(value)
 
 
@@ -64,10 +75,15 @@ def validate_detections(
     min_score: float = 0.50,
     target_label: str = "a soda can",
 ) -> dict[str, Any]:
-    """Apply a conservative, offline recognition-only gate to OWLv2 JSON.
+    """検出一覧の形式を検査し、画像上の対象候補と認識判定を辞書で返す。
 
-    Raises ValueError for malformed input instead of approving by omission.
-    A single ROI-center candidate is only a *recognition* PASS.
+    detectionsはlabel・score・boxを持つ辞書のリスト。画像サイズとROIを照合し、
+    全検出の数値・枠を検査した上で、ラベル一致、閾値以上、中心がROI内の候補を選ぶ。
+    不正な検出を黙って捨てると候補数が変わるため、対象外のラベルでも形式は検査する。
+    不正入力はValueError。複数候補から最高スコアの1件を自動選択することはしない。
+
+    戻り値には判定理由、条件、候補一覧を含める。robot_execution_allowedは常にFalse。
+    この関数のmin_score既定値は0.50で、統合デモは明示的に0.1を渡す。
     """
     if type(image_width) is not int or type(image_height) is not int:
         raise ValueError("Image dimensions must be integers")
@@ -146,6 +162,7 @@ def validate_detections(
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """検出JSONと元画像を照合するオフラインCLIの引数を定義する。"""
     parser = argparse.ArgumentParser(description="Offline OWLv2 detection gate (no motor control)")
     parser.add_argument("--detections", type=Path, default=Path("outputs/ai_demo/detections.json"))
     parser.add_argument("--image", type=Path, default=Path("outputs/ai_demo/input.jpg"))
@@ -157,6 +174,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """判定JSONを保存する。終了コードは入力等の異常1、PASSが2、FAIL/REVIEWが3。"""
     args = build_parser().parse_args(argv)
     try:
         with Image.open(args.image) as image:
@@ -191,7 +209,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("Recognition gate:", report["recognition_gate"])
     print("Robot execution allowed: NO")
     print("Report saved:", args.report_json)
-    # Exit 0 is intentionally never used to imply clearance for robot motion.
+    # 認識PASSをシェル上の成功コード0から実機の実行許可へ直結させない。
     return 2 if report["recognition_gate"] == "PASS" else 3
 
 

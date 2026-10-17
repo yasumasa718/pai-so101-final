@@ -17,6 +17,11 @@ from src.control.timed_observation import JointReadError, TimedJointReader
 
 
 def run_worker(args, stream):
+    """爪の現在値と小さな開き目標を確認し、実行指定時だけF6を動かす。
+
+    腕の5軸は書き換えず、爪の校正幅の2%を整数tickへ切り捨てて開く。
+    有効化を試みた場合はfinallyでF6のOFFと読戻しを試す。成功0、異常1。
+    """
     bus = None
     activation_attempted = False
     failed = False
@@ -117,6 +122,10 @@ def run_worker(args, stream):
 
 
 def main(argv=None):
+    """ポート・校正を検査して、上限15秒の子プロセスで単発テストを行うCLI。
+
+    --executeなしでも実機を読み取るが、位置指令やトルク操作は行わない。
+    """
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--port", required=True)
     cli.add_argument("--calibration", type=Path, required=True)

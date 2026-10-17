@@ -37,6 +37,8 @@ class ActionSender(Protocol):
 
 
 class RecordState(str, Enum):
+    """READY→RECORDING→FINISHEDの一方向の状態。処理中の異常はFAULTとして保持する。"""
+
     READY = "ready"  # まだ開始していない。
     RECORDING = "recording"  # 次のフレームを処理できる。
     FAULT = "fault"  # 異常を記憶しており、このループでは再開できない。
@@ -44,6 +46,8 @@ class RecordState(str, Enum):
 
 
 class SendStatus(str, Enum):
+    """失敗したフレームの送信状況。次の対応で未送信と送信結果不明を区別するために使う。"""
+
     NOT_ATTEMPTED = "not_attempted"  # 送信処理を呼んでいない。
     UNCERTAIN = "uncertain"  # 例外が発生したが、指令はすでにモーターへ届いた可能性がある。
     RETURNED = "returned"  # 送信処理が戻った状態。実際にモーターが動いた証拠ではない。
@@ -210,6 +214,7 @@ class SafeRecordLoop:
                 )
 
             stage = "send_action"
+            # 呼出し中の例外では送信済みか判断できないので、呼ぶ前にUNCERTAINへ切り替える。
             send_status = SendStatus.UNCERTAIN
             sent_response = self.robot.send_action(dict(to_send))
             send_status = SendStatus.RETURNED

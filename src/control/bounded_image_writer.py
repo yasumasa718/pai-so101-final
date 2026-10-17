@@ -122,11 +122,13 @@ class BoundedImageWriter:
         try:
             if self.native.queue.unfinished_tasks:
                 self._fail("Image queue must be drained before shutdown")
+            # Noneは保存スレッドを終了させる合図。各スレッドが1件ずつ受け取れるように送る。
             for _ in self.native.threads:
                 self._enqueue_locked(None)
         finally:
             condition.release()
         for thread in self.native.threads:
+            # スレッドごとにtimeout_s待つのではなく、全体で同じ期限を共有する。
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if any(thread.is_alive() for thread in self.native.threads):
             self._fail("Image worker shutdown exceeded the timeout", timeout=True)

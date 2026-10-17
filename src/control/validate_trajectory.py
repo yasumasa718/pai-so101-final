@@ -1,6 +1,12 @@
-"""Offline validation of recorded SO-101 trajectories.
+"""保存済みのSO-101経路を、実機へ接続せずに検査する。
 
-This module does not connect to robot hardware.
+LeRobotDataset v3.0のメタデータ・Parquet・Follower校正JSONを読み、
+関節名の対応→指令範囲→欠損・時刻→指令の変化量→指令と観測の差を調べる。
+guarded_teleopのJSONLを使う固定再生とは別の、データセット検証用の補助プログラム。
+
+入力値は修正せず、欠損や非有限値も後段の検査まで保持する。各検査のPASSは
+その項目に違反がないという意味で、総合判定はFAILまたは人の確認が必要なREVIEW。
+実機の衝突・把持・再生可否を判定せず、入力の変更やモーター通信も行わない。
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ import pyarrow.parquet as pq
 logger = logging.getLogger(__name__)
 
 
-# SO-101 Follower motor IDs.
+# メタデータの関節名と校正のIDを照合するための、SO-101 Followerの対応表。
 EXPECTED_MOTOR_IDS = {
     "shoulder_pan": 1,
     "shoulder_lift": 2,
@@ -30,8 +36,7 @@ EXPECTED_MOTOR_IDS = {
     "gripper": 6,
 }
 
-# LeRobot v0.6.1: sts3215 resolution is 4096, so max_res = 4095.
-# Used for degree-mode normalization of SO-101 body joints.
+# LeRobot 0.6.1ではSTS3215の4096段階を0〜4095で表し、腕の角度換算に4095を使う。
 STS3215_MAX_POSITION = 4095
 
 TRAJECTORY_COLUMNS = (
@@ -44,8 +49,8 @@ TRAJECTORY_COLUMNS = (
     "task_index",
 )
 
-# A whole vector or an individual element may be missing (None).
-# Missing and non-finite values are NOT repaired by the loader.
+# 6軸ベクトル全体、またはその一要素がNoneの場合も保持する。
+# 読込み時に欠損・NaNを補間してしまうと、後段で元データの異常を検出できなくなる。
 JointVector = tuple[float | None, ...] | None
 
 
@@ -60,7 +65,7 @@ CALIBRATION_FIELDS = (
 
 @dataclass(frozen=True)
 class MotorCalibration:
-    """Calibration data for a single motor."""
+    """1軸の校正。range_min/range_maxとhoming_offsetはモーターの整数tick値。"""
 
     id: int
     drive_mode: int
@@ -71,7 +76,7 @@ class MotorCalibration:
 
 @dataclass(frozen=True)
 class ValidationConfig:
-    """Configuration for offline trajectory validation."""
+    """入力先・内側余白・任意の検査上限。Noneの上限は未指定であり、無制限の承認ではない。"""
 
     dataset_root: Path
     calibration_path: Path
@@ -88,7 +93,7 @@ class ValidationConfig:
 
 @dataclass(frozen=True)
 class DatasetMetadata:
-    """Essential metadata for validating a recorded LeRobotDataset."""
+    """データセットの版・機種・fps・関節の並び。指令と観測の並びは別々に保持する。"""
 
     codebase_version: str
     robot_type: str
@@ -99,7 +104,7 @@ class DatasetMetadata:
 
 @dataclass(frozen=True)
 class TrajectoryData:
-    """Recorded values from one Parquet file (not a safety verdict)."""
+    """1つのParquetファイルから読み込んだ列を、元の順序と欠損を保って保持する。"""
 
     parquet_path: Path
     metadata: DatasetMetadata
@@ -113,16 +118,16 @@ class TrajectoryData:
 
     @property
     def num_frames(self) -> int:
-        """Number of loaded records."""
+        """読み込んだaction列の行数を返す。他の列との長さの一致は別途検査する。"""
         return len(self.actions)
 
 
 @dataclass(frozen=True)
 class JointMapping:
-    """Verified correspondence between feature indices and a follower motor.
+    """モーター名・IDと、指令配列・観測配列それぞれの添字との照合済み対応。
 
-    expected_unit is a configuration assumption, NOT a unit inferred from
-    the LeRobotDataset metadata or a physical-safety certification.
+    expected_unitは想定する設定であり、データセットから推定した単位ではない。
+    収録時にその単位が使われたかは別途確認する必要がある。
     """
 
     motor_name: str
@@ -134,10 +139,9 @@ class JointMapping:
 
 @dataclass(frozen=True)
 class JointLimits:
-    """Configured bounds, not certified physical or collision-safe limits.
+    """校正由来の範囲と、両端からmarginを引いた検査用の有効範囲。
 
-    Values are expressed in degrees (F1-F5) or normalized 0..100 (F6).
-    The effective bounds account for an optional inward margin.
+    F1〜F5は度、F6は0〜100のポイント。機械的な限界や衝突しない範囲の保証ではない。
     """
 
     motor_name: str
@@ -152,14 +156,12 @@ class JointLimits:
 
 @dataclass(frozen=True)
 class JointLimitCheck:
-    """Results for one joint's recorded position commands (action only).
+    """1軸の記録指令（action）の範囲検査結果。観測位置の検査結果ではない。
 
-    Violations are counted in mutually exclusive categories:
-    - configured_range_violations: outside the calibration-derived bounds
-    - margin_only_violations: inside configured bounds but outside inward margin
-    - invalid_values: null, NaN, infinity, or non-numeric command
-
-    A PASS here does not authorize playback; other checks are still pending.
+    違反は校正範囲外、内側余白だけの違反、不正値のいずれかに分類し、重複計上しない。
+    最初の問題の行・フレーム・時刻と最大超過量を残す。observed_minimum/maximumは
+    検査中に見つかった指令値の最小・最大を表し、observation.stateの値ではない。
+    この項目のPASSだけで再生を許可することはできない。
     """
 
     motor_name: str
@@ -180,7 +182,7 @@ class JointLimitCheck:
 
     @property
     def total_problems(self) -> int:
-        """Number of problematic joint samples (one category per sample)."""
+        """3種類の違反数を足し、この軸の問題サンプル総数を返す。"""
         return (
             self.configured_range_violations
             + self.margin_only_violations
@@ -189,13 +191,13 @@ class JointLimitCheck:
 
     @property
     def passed(self) -> bool:
-        """Whether all recorded commands pass this joint's range check."""
+        """この軸の全記録指令が範囲検査を通ったかを返す。"""
         return self.total_problems == 0
 
 
 @dataclass(frozen=True)
 class IntegrityIssue:
-    """Example of a quality problem, with zero-based Parquet row index."""
+    """データ品質の問題例。rowはParquet内の0始まりの行番号で、frame_indexとは別。"""
 
     kind: str
     row: int
@@ -204,7 +206,7 @@ class IntegrityIssue:
 
 @dataclass(frozen=True)
 class DataIntegrityResult:
-    """Data-quality verdict, independent of motor limits or physical safety."""
+    """欠損・番号・時刻などの品質検査結果。関節範囲や実機の安全性とは別に評価する。"""
 
     issue_counts: dict[str, int]
     examples: tuple[IntegrityIssue, ...]
@@ -219,7 +221,7 @@ class DataIntegrityResult:
 
 @dataclass(frozen=True)
 class JointJumpCheck:
-    """Recorded command changes; thresholds are user-configured, not certified."""
+    """隣接指令の変化量・変化速度と違反数。上限値は利用者が指定した検査条件。"""
 
     motor_name: str
     motor_id: int
@@ -246,9 +248,9 @@ class JointJumpCheck:
 
 @dataclass(frozen=True)
 class TrackingLagMetric:
-    """Exploratory action/state mismatch for an explicit frame shift.
+    """観測と数フレーム前の指令との差をまとめた、時間ずれの探索用指標。
 
-    NOT a true servo tracking-error measurement or a replay safety check.
+    同期したサーボの追従誤差測定ではなく、再生可否の判定にも使わない。
     """
 
     motor_name: str
@@ -263,9 +265,9 @@ class TrackingLagMetric:
 
 @dataclass(frozen=True)
 class ValidationInputs:
-    """Data and verified joint mapping needed by later safety checks.
+    """読込み済みデータと関節の対応表をまとめ、後段の検査へ渡す。
 
-    Successfully creating this object is NOT a trajectory safety approval.
+    このオブジェクトを作れた段階では、指令の範囲・時刻等はまだ未検査。
     """
 
     metadata: DatasetMetadata
@@ -277,15 +279,11 @@ class ValidationInputs:
 def load_calibration(
     path: Path,
 ) -> dict[str, MotorCalibration]:
-    """Load and validate SO-101 Follower calibration JSON.
+    """SO-101の6軸分の校正JSONを検査し、モーター名→MotorCalibrationを返す。
 
-    This function only reads the file.
-    It never modifies calibration data or connects to hardware.
-
-    Raises:
-        OSError: If the file cannot be opened.
-        json.JSONDecodeError: If the JSON is malformed.
-        ValueError: If calibration data is invalid.
+    ID、必須整数フィールド、drive_mode、生値の範囲を確認する。読取りのみで、
+    ファイルの更新や実機照合は行わない。ファイル読込みはOSError、JSON形式は
+    JSONDecodeError、校正内容の不整合はValueErrorとして呼出し側へ伝える。
     """
     logger.info("Loading calibration: %s", path)
 
@@ -375,7 +373,7 @@ def _read_feature_names(
     features: dict[str, object],
     feature_key: str,
 ) -> tuple[str, ...]:
-    """Validate a joint-position feature and return its ordered names."""
+    """float32・6要素の特徴量定義を検査し、重複のない関節名を記録順で返す。"""
     feature = features.get(feature_key)
 
     if not isinstance(feature, dict):
@@ -401,15 +399,10 @@ def _read_feature_names(
 
 
 def load_dataset_metadata(dataset_root: Path) -> DatasetMetadata:
-    """Read and validate LeRobotDataset v3 metadata without modifying it.
+    """dataset_root/meta/info.jsonを読み、対応する版・機種・特徴量かを検査する。
 
-    Args:
-        dataset_root: Directory containing meta/info.json.
-
-    Raises:
-        OSError: If meta/info.json cannot be opened.
-        json.JSONDecodeError: If the JSON is malformed.
-        ValueError: If required metadata is missing or unsupported.
+    v3.0、so_follower、正のfps、6関節の指令・観測が必要。入力は変更しない。
+    読込み不可はOSError、不正JSONはJSONDecodeError、未対応・不足項目はValueError。
     """
     metadata_path = dataset_root / "meta" / "info.json"
     logger.info("Loading dataset metadata: %s", metadata_path)
@@ -463,7 +456,7 @@ def _read_joint_vectors(
     values: list[list[float | None] | None],
     column_name: str,
 ) -> tuple[JointVector, ...]:
-    """Keep joint data in recorded order, including missing values."""
+    """関節列をtupleへ変換する。非欠損の行は6要素を要求し、NoneやNaNは保持する。"""
     vectors: list[JointVector] = []
 
     for row_index, value in enumerate(values):
@@ -486,30 +479,19 @@ def load_trajectory(
     parquet_path: Path,
     metadata: DatasetMetadata,
 ) -> TrajectoryData:
-    """Read one trajectory Parquet file without modifying any data.
+    """単一のParquetを読み、記録順を保ったTrajectoryDataを返す。
 
-    Checks required columns and Arrow column types, but DOES NOT approve
-    the trajectory for replay. NaN, nulls, time order, and physical limits
-    are inspected in later validation steps; all values are preserved.
-
-    Args:
-        parquet_path: Path to a single data/chunk-XXX/file-YYY.parquet.
-        metadata: Dataset metadata obtained with load_dataset_metadata().
-
-    Returns:
-        TrajectoryData in recorded row and column order.
-
-    Raises:
-        OSError: File cannot be opened.
-        ValueError: Required columns/types or frame structure are invalid.
-        pyarrow.ArrowException: Parquet cannot be decoded.
+    parquet_pathはdata配下の1ファイル、metadataはload_dataset_metadataの戻り値。
+    必須列とArrowの型・6軸の構造を確認する。NaN、欠損、時刻順、指令範囲は
+    後段で検査するため、値の修復・行の並べ替えはしない。
+    読込み不可はOSError、型や構造の不整合はValueError、復号失敗はArrowException。
     """
     if len(metadata.action_names) != 6 or len(metadata.observation_state_names) != 6:
         raise ValueError("Dataset metadata must describe six joint positions")
 
     logger.info("Loading trajectory: %s", parquet_path)
 
-    # ParquetFile only accesses an existing file; it doesn't connect to LeRobot.
+    # 既存ファイルを読むだけで、LeRobotの実機オブジェクトは作らない。
     parquet_file = pq.ParquetFile(parquet_path)
     schema = parquet_file.schema_arrow
 
@@ -564,9 +546,9 @@ def _motor_indices_from_feature_names(
     names: tuple[str, ...],
     feature_key: str,
 ) -> dict[str, int]:
-    """Map `<motor>.pos` metadata names to zero-based feature indices.
+    """<motor>.pos形式の名前から、モーター名→0始まりの列内添字を作る。
 
-    Does not assume an order of motors or silently drop unknown features.
+    F1〜F6の固定順を仮定せず、未知・重複・不足した関節はValueErrorにする。
     """
     indices: dict[str, int] = {}
 
@@ -600,15 +582,12 @@ def validate_joint_mapping(
     metadata: DatasetMetadata,
     calibrations: dict[str, MotorCalibration],
 ) -> tuple[JointMapping, ...]:
-    """Verify motor names/IDs and derive both feature column indices.
+    """関節名・校正IDを照合し、指令と観測の添字を別々に求めた対応表を返す。
 
-    The output order follows `action_names` in meta/info.json, not a
-    hard-coded F1-F6 array order. `observation.state` can have its own
-    order, so its index is resolved separately by motor name.
-
-    Does not inspect trajectory positions or establish unit correctness.
-    Raises ValueError on missing/extra/duplicate/malformed joint names or
-    calibration ID mismatches.
+    出力順はmeta/info.jsonのaction_namesに従う。observation.stateの配列順が
+    異なっていても、同じモーターの値を比較できるよう名前で結びつける。
+    関節名の不足・余分・重複・形式不正やID不一致はValueError。
+    ここでは経路の値や、収録時の単位の正しさは確認しない。
     """
     if metadata.robot_type != "so_follower":
         raise ValueError(
@@ -668,23 +647,15 @@ def calculate_joint_limits(
     margin_deg: float = 0.0,
     margin_gripper: float = 0.0,
 ) -> tuple[JointLimits, ...]:
-    """Calculate configured Follower limits using LeRobot 0.6.1 units.
+    """校正からLeRobot 0.6.1の単位で範囲を求め、内側余白付きのJointLimitsを返す。
 
-    F1-F5 (degree mode):
-        (raw_position - (range_min + range_max)/2) * 360 / 4095
-    F6 (range_0_100 mode):
-        position values are in [0, 100]; drive_mode=1 reverses direction
-        but does not change that interval.
+    F1〜F5の換算は(raw_position - (range_min + range_max)/2) * 360 / 4095。
+    F6は0〜100で、drive_mode=1でも向きが反転するだけで区間は変わらない。
+    homing_offsetは機器の位置レジスタへ反映済みなので二重に加算しない。
 
-    ``homing_offset`` is already accounted for by the device's position
-    register and must not be added again in this conversion.
-
-    The dataset does not explicitly record the normalization mode.
-    The caller must independently verify that F1-F5 were recorded with
-    ``use_degrees=True`` and that this calibration was valid at recording.
-
-    The function neither reads joint commands nor authorizes replay.
-    Margins are non-negative quantities in each joint's output unit.
+    データセットは正規化モードを明示しないため、収録時にuse_degrees=Trueであり、
+    校正が有効だったことは呼出し側で別途確認する。marginは各軸の単位で非負とする。
+    この関数は指令値を検査せず、再生も許可しない。
     """
     for option_name, value in (
         ("margin_deg", margin_deg),
@@ -712,14 +683,13 @@ def calculate_joint_limits(
         if motor_name == "gripper":
             if joint.expected_unit != "normalized_0_100":
                 raise ValueError("gripper: unexpected unit")
-            # Both drive modes cover [0, 100]. Only direction changes.
+            # drive_modeによる向きの違いがあっても、検査区間は0〜100で共通。
             minimum, maximum = 0.0, 100.0
             margin = float(margin_gripper)
         else:
             if joint.expected_unit != "degree":
                 raise ValueError(f"{motor_name}: expected degree unit")
-            # LeRobot degrees normalization uses the midpoint of the
-            # calibration ticks and model_resolution_table[sts3215] - 1.
+            # 校正の中点を0度とし、機種の分解能から1を引いた値を換算の分母に使う。
             midpoint = (cal.range_min + cal.range_max) / 2.0
             minimum = (cal.range_min - midpoint) * 360.0 / STS3215_MAX_POSITION
             maximum = (cal.range_max - midpoint) * 360.0 / STS3215_MAX_POSITION
@@ -754,15 +724,11 @@ def check_joint_limits(
     mappings: tuple[JointMapping, ...],
     limits: tuple[JointLimits, ...],
 ) -> tuple[JointLimitCheck, ...]:
-    """Check every recorded action against calibration-derived joint bounds.
+    """全記録指令を関節の校正範囲・内側余白と比較し、軸ごとの検査結果を返す。
 
-    Valid finite commands are checked against original bounds first, then
-    inward-margin bounds. Invalid values are never silently repaired.
-    observation.state is deliberately NOT checked here: it is a separately
-    sampled measurement, not the commanded trajectory.
-
-    This offline check cannot establish collision safety, motor torque,
-    actual speed or safe playback; the caller must never treat it as approval.
+    有限な値はまず元の範囲、次に余白付き範囲と比較する。不正値は補正せず違反に数える。
+    observation.stateは別の時点の実測値なので、この指令範囲検査の対象にはしない。
+    ロボットの衝突・トルク・実測速度は確認できず、結果を再生許可として扱わない。
     """
     if trajectory.num_frames == 0:
         raise ValueError("Trajectory contains no frames")
@@ -902,11 +868,12 @@ def check_joint_limits(
 
 
 def _valid_number(value: object) -> bool:
-    """Reject booleans, nulls, NaN and +/-infinity."""
+    """bool・None・NaN・無限大を除く、有限なint/floatかを判定する。"""
     return type(value) in (float, int) and math.isfinite(value)
 
 
 def _validate_optional_positive(name: str, value: float | None) -> None:
+    """Noneなら上限未指定とし、指定された場合は有限かつ正の数を要求する。"""
     if value is not None and (not _valid_number(value) or value <= 0):
         raise ValueError(f"{name} must be finite and > 0 when provided: {value!r}")
 
@@ -916,13 +883,12 @@ def check_data_integrity(
     *,
     max_gap_seconds: float | None = None,
 ) -> DataIntegrityResult:
-    """Validate timestamps, row identifiers and both joint-vector columns.
+    """指令・観測の欠損、行番号、時刻の整合を検査し、件数と問題例を返す。
 
-    Time must strictly increase *within each episode*. Frame indices must
-    start at zero for each episode and then increase by one. Dataset-wide
-    index increases by one; task_index needs to be a nonnegative integer.
-    No gap threshold is presumed safe: set max_gap_seconds to opt in.
-    Missing/nonfinite values are recorded, never repaired.
+    各エピソード内では時刻の厳密な増加と、0から始まるframe_indexの連番を要求する。
+    データセット全体のindexは連番、task_indexは非負整数でなければならない。
+    時間間隔の上限検査はmax_gap_secondsを指定した場合だけ行う。
+    問題例は先頭30件まで保持するが、違反の件数は全行で集計する。値の修復はしない。
     """
     _validate_optional_positive("max_gap_seconds", max_gap_seconds)
     n = trajectory.num_frames
@@ -940,6 +906,7 @@ def check_data_integrity(
     examples: list[IntegrityIssue] = []
 
     def issue(kind: str, row: int, detail: str) -> None:
+        """種類別の件数を増やし、レポートが巨大にならない範囲で具体例を残す。"""
         counts[kind] = counts.get(kind, 0) + 1
         if len(examples) < 30:
             examples.append(IntegrityIssue(kind, row, detail))
@@ -991,7 +958,8 @@ def check_data_integrity(
             issue("index.discontinuous", row, f"{previous_index} -> {global_index}")
         previous_index = global_index if valid_global else None
 
-        # Episode transitions may reset frame_index and timestamp.
+        # エピソードが替わるとframe_indexとtimestampはリセットされる。
+        # その境界を時間逆行や指令の連続動作として扱わない。
         same_episode = (
             valid_episode and previous_episode is not None
             and episode == previous_episode
@@ -1036,12 +1004,12 @@ def check_position_jumps(
     max_speed_deg_s: float | None = None,
     max_speed_gripper_s: float | None = None,
 ) -> tuple[JointJumpCheck, ...]:
-    """Inspect adjacent recorded position commands within the same episode.
+    """同じエピソードの隣接指令について、変化量と時間差から求めた速度を集計する。
 
-    Step is |action[i] - action[i-1]|; speed is step / timestamp delta.
-    Both are *command* properties, not measured motor speeds. No numerical
-    thresholds are assumed safe. Invalid samples are handled by the separate
-    data-integrity check; they are omitted from jump diagnostics.
+    変化量は|action[i] - action[i-1]|、速度はそれを記録時刻の差で割った値。
+    実測したモーター速度ではない。腕と爪の上限は単位が異なるため別々に指定する。
+    不正なサンプルは比較から除き、別途check_data_integrityで報告する。
+    上限未指定でも最大値を集計するが、違反判定済みのPASSとは区別する。
     """
     for name, value in (
         ("max_step_deg", max_step_deg),
@@ -1115,12 +1083,12 @@ def analyze_tracking_difference(
     *,
     max_lag_frames: int = 3,
 ) -> tuple[TrackingLagMetric, ...]:
-    """Report action/state absolute differences at lags 0..N for diagnosis.
+    """0〜max_lag_framesだけ指令を遡り、観測との差の平均・最大を軸別に返す。
 
-    For lag L at row i, compares state[i] against action[i-L]. This is an
-    exploratory alignment only; acquisition occurs at different times and
-    servo dynamics introduce additional lag. Do not interpret these values
-    as synchronized tracking errors or use them to authorize replay.
+    遅れLならstate[i]とaction[i-L]を比較する。同じエピソードで有効な値だけを使い、
+    比較可能な値がなければ統計値はNone。添字は関節名の対応表からそれぞれ求める。
+    取得時刻のずれとサーボ応答の遅れが混ざるため、同期した追従誤差や再生可否ではなく、
+    指令と観測の対応を調べる診断値として使う。
     """
     if type(max_lag_frames) is not int or not 0 <= max_lag_frames <= 30:
         raise ValueError("max_lag_frames must be an integer from 0 to 30")
@@ -1163,6 +1131,7 @@ def analyze_tracking_difference(
 
 
 def _sha256_file(path: Path) -> str:
+    """ファイルを1 MiBずつ読み、レポートで入力を識別するSHA-256を求める。"""
     digest = hashlib.sha256()
     with path.open("rb") as file:
         for chunk in iter(lambda: file.read(1024 * 1024), b""):
@@ -1179,7 +1148,13 @@ def build_validation_report(
     jumps: tuple[JointJumpCheck, ...],
     tracking: tuple[TrackingLagMetric, ...],
 ) -> dict[str, object]:
-    """Make JSON-safe diagnostic report without ever approving playback."""
+    """各検査の結果・条件・入力ハッシュを、JSONに保存できる診断辞書へまとめる。
+
+    範囲・データ品質・指定上限のいずれかに違反があればFAIL、それ以外もREVIEWとする。
+    追従差は診断値として載せるだけで、判定には使わない。auto_replay_eligibleは常にFalse。
+    ハッシュはこの関数を呼んだ時点でファイルを読み直して求めるため、検査中は入力を
+    変更しないこと。読込み時と同一バイト列であることを保証する仕組みではない。
+    """
     failed_range = any(not item.passed for item in range_checks)
     failed_jumps = any(item.status == "FAIL" for item in jumps)
     status = "FAIL" if failed_range or not integrity.passed or failed_jumps else "REVIEW"
@@ -1242,7 +1217,10 @@ def build_validation_report(
 
 
 def save_json_report(report: dict[str, object], output_path: Path, config: ValidationConfig) -> None:
-    """Write only a user-requested report; protect dataset and calibration inputs."""
+    """明示した出力先にレポートを書く。データセット配下と校正ファイルへの出力は拒否する。
+
+    パスを解決してから比較する。出力先の親フォルダーは作成し、既存レポートは上書きする。
+    """
     destination = output_path.expanduser().resolve()
     dataset_dir = config.dataset_root.expanduser().resolve()
     calibration_path = config.calibration_path.expanduser().resolve()
@@ -1256,10 +1234,10 @@ def save_json_report(report: dict[str, object], output_path: Path, config: Valid
 
 
 def _find_single_parquet(dataset_root: Path) -> Path:
-    """Find the sole Parquet data file; reject ambiguous multi-file inputs.
+    """data配下のParquetを探し、ちょうど1ファイルの場合だけそのパスを返す。
 
-    Multi-file dataset support is intentionally postponed. Selecting the
-    first file silently could incorrectly approve only part of a dataset.
+    複数ファイルから先頭だけを選ぶと一部しか検査しない結果になるため、
+    複数ファイルのデータセットは明示的に拒否する。
     """
     data_dir = dataset_root / "data"
     if not data_dir.is_dir():
@@ -1278,21 +1256,11 @@ def load_validation_inputs(
     dataset_root: Path,
     calibration_path: Path,
 ) -> ValidationInputs:
-    """Load all offline inputs and verify motor mapping in one operation.
+    """メタデータ・校正・関節対応・経路をまとめて読み、ValidationInputsを返す。
 
-    Input files are read only. No motor communication, command sending,
-    trajectory-limit check or replay approval takes place in this function.
-
-    Args:
-        dataset_root: Root of a LeRobotDataset v3.0.
-        calibration_path: Saved Follower calibration JSON file.
-
-    The dataset must contain exactly one Parquet data file.
-
-    Raises:
-        OSError: Input files or directories cannot be accessed.
-        ValueError: Metadata, calibration, mapping or Parquet format invalid.
-        pyarrow.ArrowException: Parquet decode error.
+    dataset_rootはLeRobotDataset v3.0のルート、calibration_pathはFollowerの校正JSON。
+    Parquetは1ファイルに限る。入力を読み取るだけで指令範囲検査や実機通信は行わない。
+    アクセス不可はOSError、不正な形式・対応はValueError、Parquet復号失敗はArrowException。
     """
     metadata = load_dataset_metadata(dataset_root)
     calibrations = load_calibration(calibration_path)
@@ -1315,7 +1283,7 @@ def load_validation_inputs(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Configure offline-only checks; optional thresholds are not safety claims."""
+    """オフライン検査の入力と任意の上限を定義する。上限は実機安全性の認証値ではない。"""
     parser = argparse.ArgumentParser(description="Offline SO-101 trajectory validator")
     parser.add_argument("--dataset-root", type=Path, required=True)
     parser.add_argument("--calibration", type=Path, required=True)
@@ -1332,10 +1300,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    """Complete offline checks but NEVER authorize hardware replay.
+    """一連の検査と結果表示を行い、指定時だけJSONレポートも保存するCLI。
 
-    Return codes: 1=input/runtime error, 2=diagnostic REVIEW,
-    3=detected violation (FAIL). Exit 0 is intentionally never emitted.
+    終了コードは入力・実行エラー1、要確認REVIEWが2、違反FAILが3。
+    正常に検査できたことを実機再生の許可と誤認しないよう、0は返さない。
     """
     logging.basicConfig(level=logging.INFO)
     args = build_parser().parse_args()

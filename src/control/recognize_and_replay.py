@@ -2,6 +2,11 @@
 
 --execute時もROI内候補が1件のPASS以外はロボットに接続しない。
 缶・箱・カメラ・土台の配置を保ち、開始姿勢へ合わせて使用する。
+
+処理順は入力経路の事前検査→モデル読込み→撮影→候補判定→固定経路再生。
+画像から関節角度を計算するのではなく、認識結果を記録経路の開始条件に使う。
+親プロセスはevents.jsonlへの出力と子プロセスの期限を管理し、
+子プロセスが撮影・推論・実機処理を順に担当する。
 """
 
 import argparse
@@ -28,6 +33,11 @@ MAX_IMAGE_AGE_S = 10.0
 
 
 def capture(args):
+    """固定カメラ設定で1枚保存し、画像Pathと設定・読取り時刻のメタデータを返す。
+
+    保存先はoutput_dir/camera。成功・失敗のどちらでもカメラを解放する。
+    時刻は再生の開始期限と比較できるようtime.monotonicで記録する。
+    """
     image_dir = args.output_dir / "camera"
     image_dir.mkdir()
     camera = DiagnosticCamera(device=args.camera, image_dir=image_dir, width=640, height=480,
@@ -42,6 +52,12 @@ def capture(args):
 
 
 def run_worker(args, stream):
+    """認識から再生までを実行し、JSONLイベントをstreamへ出力する。
+
+    実行指定なし、または認識がPASS以外なら接続せず0を返す。したがって0だけでは
+    動作完了を示さず、collection_completeのreplay_attempted/replay_completedも見る。
+    実機処理とトルク解除はreplay.run_workerへ委譲し、異常終了は非0とする。
+    """
     stage = "preflight"
     try:
         _, _, plan = replay.prepare(args)
@@ -77,12 +93,15 @@ def run_worker(args, stream):
                  reason="recognition_only" if not args.execute else "recognition_"+gate)
             return 0
         stage = "image_age"
+        # 推論に費やした時間も期限に含める。これはホストのread開始からの経過時間で、
+        # カメラ内部の露光時刻や、撮影後に物が動いていないことを保証するものではない。
         activation_deadline = metadata["read_started_at"]+MAX_IMAGE_AGE_S
         if time.monotonic() >= activation_deadline:
             raise TimeoutError("Recognition image expired before robot connection")
         print("認識PASSです。開始姿勢・校正・トルク状態を照合してから固定再生します。",
               file=sys.stderr, flush=True)
         stage = "replay"
+        # 接続・開始姿勢照合にも時間がかかるため、同じ期限を再生側へ渡して再確認する。
         code = replay.run_worker(args, stream, activation_deadline=activation_deadline)
         emit(stream, "collection_complete", recognition_gate=gate,
              replay_attempted=True, replay_completed=code == 0,
@@ -102,6 +121,11 @@ def run_worker(args, stream):
 
 
 def main(argv=None):
+    """入力条件を検査し、新規の出力先と監視付き子プロセスを用意するCLI。
+
+    --imageは保存画像による認識確認専用。--executeとの併用は引数検査で拒否する。
+    --_workerおよび入力ハッシュの引数は親子間の照合に使う内部用オプション。
+    """
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("--source-log", type=Path, required=True)
     cli.add_argument("--checkpoints", type=Path, required=True)
@@ -129,6 +153,7 @@ def main(argv=None):
     if args.execute and (not args.port or Path(args.port).parent != Path("/dev/serial/by-id")):
         cli.error("Use --port /dev/serial/by-id/... for the Follower")
     if args._worker:
+        # 親からのSIGTERMを例外に変え、再生側のfinallyによる解除を試みられるようにする。
         def interrupted(signum, frame):
             raise KeyboardInterrupt()
         signal.signal(signal.SIGTERM, interrupted)

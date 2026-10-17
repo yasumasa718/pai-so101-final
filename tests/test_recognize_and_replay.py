@@ -1,4 +1,8 @@
-"""撮影・検出・モーターを模擬し、認識から固定再生への境界を確認する。"""
+"""撮影・検出・モーターを模擬し、認識から固定再生へ進む条件を検証する。
+
+再生テストの模擬バス・時計を再利用し、画像だけは一時フォルダーへ実際に保存する。
+候補数、画像の古さ、開始姿勢、途中失敗を変え、接続・送信の有無と終了ログを確認する。
+"""
 
 import io
 import json
@@ -19,6 +23,7 @@ CAN = {"label": "a soda can", "score": 0.71,
 
 @pytest.fixture
 def setup(replay_setup, monkeypatch, tmp_path):
+    """再生用fixtureへ模擬カメラと缶1件の検出器を追加し、変更可能な候補リストとともに返す。"""
     args, bus, _, _, clock = replay_setup
     args.image = None
     args.camera = "/dev/video0"
@@ -30,6 +35,7 @@ def setup(replay_setup, monkeypatch, tmp_path):
     detections = [CAN]
 
     class Camera:
+        """一定のRGB画像を保存し、作成された個数と解放状態を追跡するカメラ代役。"""
         def __init__(self, **kwargs):
             self.directory = kwargs["image_dir"]
             self.closed = False
@@ -48,21 +54,28 @@ def setup(replay_setup, monkeypatch, tmp_path):
             self.closed = True
 
     def detector(image, **kwargs):
+        """撮影用カメラが閉じていることを検査してから、現在の候補リストのコピーを返す。"""
         assert all(c.closed for c in cameras)  # カメラを閉じてから推論・接続する。
         return list(detections)
 
+    # バスと時計は再生テストのfixtureで差替え済み。ここでは撮影・モデル読込みだけを置き換える。
     monkeypatch.setattr(collection, "DiagnosticCamera", Camera)
     monkeypatch.setattr(collection, "load_detector", lambda: detector)
     return args, bus, clock, cameras, detections
 
 
 def run(args):
+    """統合処理の子側入口を直接呼び、終了コードと解析済みJSONLイベントを返す。"""
     stream = io.StringIO()
     code = collection.run_worker(args, stream)
     return code, records(stream.getvalue())
 
 
 def test_fresh_pass_runs_existing_replay_and_releases_all_axes(setup):
+    """新しい画像のPASSから5要所の再生完了まで進み、全軸OFFと統合完了ログが残ることを確認する。
+
+    認識判定ファイル自体の実行許可フラグはFalseのままであることも確かめる。
+    """
     args, bus, _, cameras, _ = setup
     code, rows = run(args)
     assert code == 0
@@ -77,6 +90,7 @@ def test_fresh_pass_runs_existing_replay_and_releases_all_axes(setup):
 
 @pytest.mark.parametrize("count,gate", [(0, "FAIL"), (2, "REVIEW")])
 def test_no_target_or_multiple_targets_never_connects_even_when_execute_requested(setup, count, gate):
+    """実行指定があっても候補0件・2件なら再生せず、接続も書込みもしないことを確認する。"""
     args, bus, _, _, detections = setup
     detections[:] = [CAN]*count
     code, rows = run(args)
@@ -89,6 +103,7 @@ def test_no_target_or_multiple_targets_never_connects_even_when_execute_requeste
 
 @pytest.mark.parametrize("saved_image", [False, True])
 def test_default_recognition_only_never_connects_for_pass(setup, saved_image, tmp_path):
+    """認識専用モードでは撮影画像・保存画像のどちらがPASSでも接続せず、保存画像時は撮影もしないことを確認する。"""
     args, bus, _, cameras, _ = setup
     args.execute = False
     if saved_image:
@@ -102,6 +117,7 @@ def test_default_recognition_only_never_connects_for_pass(setup, saved_image, tm
 
 
 def test_inference_too_slow_rejects_before_motor_connection(setup, monkeypatch):
+    """模擬時計で推論時間を画像の期限より長くし、モーターへ接続する前に拒否することを確認する。"""
     args, bus, clock, _, _ = setup
     def detector(*a, **kw):
         clock.now += collection.MAX_IMAGE_AGE_S+1
@@ -114,6 +130,7 @@ def test_inference_too_slow_rejects_before_motor_connection(setup, monkeypatch):
 
 @pytest.mark.parametrize("stage", ["model_load", "capture", "recognition"])
 def test_capture_and_model_failures_never_connect(setup, monkeypatch, stage):
+    """モデル読込み・撮影・推論の各例外で接続を防ぎ、カメラを解放し、例外内の識別情報をログへ漏らさないことを確認する。"""
     args, bus, _, cameras, _ = setup
     def failed(*a, **kw):
         raise RuntimeError("SECRET_PORT")
@@ -131,6 +148,7 @@ def test_capture_and_model_failures_never_connect(setup, monkeypatch, stage):
 
 
 def test_pass_does_not_bypass_start_pose_check(setup):
+    """認識PASSでも開始姿勢がずれていれば、位置指令・トルク書込み前に再生が失敗することを確認する。"""
     args, bus, _, _, _ = setup
     bus.raw["shoulder_pan"] += 100
     code, rows = run(args)
@@ -140,6 +158,7 @@ def test_pass_does_not_bypass_start_pose_check(setup):
 
 
 def test_replay_failure_still_releases_and_collection_cannot_claim_success(setup):
+    """再生中の送信失敗でもトルクを解除し、統合ログが再生完了を報告しないことを確認する。"""
     args, bus, _, _, _ = setup
     bus.fail_send = True
     code, rows = run(args)
@@ -149,12 +168,14 @@ def test_replay_failure_still_releases_and_collection_cannot_claim_success(setup
 
 
 def argv(args, output):
+    """親CLIの起動に必要な経路・校正・ROI・出力先の引数を組み立てる。"""
     return ["--source-log", str(args.source_log), "--checkpoints", str(args.checkpoints),
             "--calibration", str(args.calibration), "--expected-sha256", args.expected_sha256,
             "--roi", "260,210,350,350", "--output-dir", str(output)]
 
 
 def test_cli_rejects_saved_image_for_execution_before_connect_or_output_creation(setup, tmp_path):
+    """保存画像と実行指定の併用を引数エラーにし、出力先作成・撮影・接続より前に拒否することを確認する。"""
     args, bus, _, cameras, _ = setup
     output = tmp_path / "not_created"
     with pytest.raises(SystemExit) as error:
@@ -164,6 +185,7 @@ def test_cli_rejects_saved_image_for_execution_before_connect_or_output_creation
 
 
 def test_supervised_cli_pins_inputs_and_preserves_existing_output(setup, tmp_path, monkeypatch):
+    """親が入力ハッシュと期限を子へ渡し、既存出力先への再実行ではログを上書きしないことを確認する。"""
     args, bus, _, _, _ = setup
     output = tmp_path / "parent"
     def supervise(command, stream, timeout_s, **kwargs):
@@ -181,6 +203,7 @@ def test_supervised_cli_pins_inputs_and_preserves_existing_output(setup, tmp_pat
 
 
 def test_worker_detects_input_changed_before_loading_model_or_camera(setup):
+    """親から渡された元ログのハッシュが異なると、撮影・接続より前の事前検査で失敗することを確認する。"""
     args, bus, _, cameras, _ = setup
     args._source_sha256 = "0"*64
     code, rows = run(args)

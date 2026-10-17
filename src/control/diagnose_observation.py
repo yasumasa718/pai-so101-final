@@ -26,6 +26,11 @@ from src.control.timed_observation import JointReadError, TimedJointReader, fini
 
 
 def emit(stream: TextIO, event: str, **fields: object) -> None:
+    """イベントをJSONLの1行として書き、直ちにflushする。NaN・無限大は許可しない。
+
+    制御CLIでも共用する。人向け表示はstderrへ分け、streamには解析可能な記録を残す。
+    flushはPythonのバッファを送る操作で、ディスクへの永続化完了を保証するものではない。
+    """
     stream.write(json.dumps({"event": event, **fields}, ensure_ascii=False, allow_nan=False) + "\n")
     stream.flush()
 
@@ -38,12 +43,19 @@ class FakeBus:
 
 
 class RegisterMismatch(ValueError):
+    """モーター内部設定の不一致を、軸名・レジスタ名・期待値・実測値とともに保持する。"""
+
     def __init__(self, motor: str, register: str, expected: object, actual: object):
         super().__init__(f"Motor register mismatch: {motor}.{register}")
         self.details = {"motor": motor, "register": register, "expected": expected, "actual": actual}
 
 
 def load_calibration(path: Path, expected_sha256: str) -> tuple[dict, ActionGuard]:
+    """校正のハッシュと形式を照合し、同じ読込み内容から校正辞書と範囲検査器を返す。
+
+    expected_sha256は事前に確認した固定値。ここで現在のファイルから期待値を
+    作り直してはいけない。機器内部の照合は接続後のverify_registersが担当する。
+    """
     payload = path.read_bytes()
     if hashlib.sha256(payload).hexdigest() != expected_sha256.lower():
         raise ValueError("Follower calibration SHA-256 mismatch")
@@ -57,6 +69,11 @@ def load_calibration(path: Path, expected_sha256: str) -> tuple[dict, ActionGuar
 
 
 def make_hardware_bus(port: str, calibration: dict):
+    """対応を確認したLeRobot版で、SO-101の6軸バスを構築する。接続はまだ行わない。
+
+    腕は度、爪は0〜100に正規化する設定。実機用ライブラリをここで読み込むことで、
+    模擬読取りの診断はLeRobotをimportせずに実行できる。
+    """
     if version("lerobot") != "0.6.1":
         raise RuntimeError("Hardware diagnostic requires audited LeRobot 0.6.1")
     from lerobot.motors import Motor, MotorCalibration, MotorNormMode
@@ -74,7 +91,11 @@ def make_hardware_bus(port: str, calibration: dict):
 
 
 def verify_registers(bus, calibration: dict) -> dict:
-    """設定を書かずに照合。失敗時に修復・再校正は行わない。"""
+    """各軸のID・モデル・校正・動作モードを読み取り、照合済みレジスタ辞書を返す。
+
+    設定を書かずに照合し、不一致でも修復・再校正しない。Torque_Enableは0/1の形式を
+    確認するだけで、全軸OFFを要求する実行CLIは戻り値に対して追加検査を行う。
+    """
     result = {}
     for name, motor_id in MOTOR_IDS.items():
         registers = {
@@ -104,10 +125,12 @@ def verify_registers(bus, calibration: dict) -> dict:
 
 
 def image_directory(output: Path) -> Path:
+    """診断ログ名から、同じ親フォルダー内の<ログ名>_imagesという画像保存先を求める。"""
     return output.with_name(output.stem + "_images")
 
 
 def make_camera(args: argparse.Namespace) -> DiagnosticCamera:
+    """診断CLIの設定から、未オープンの実機または模擬カメラを作る。"""
     return DiagnosticCamera(
         device=args.camera, image_dir=image_directory(args.output), width=args.camera_width,
         height=args.camera_height, fps=args.camera_fps, focus=args.camera_focus,
@@ -120,6 +143,11 @@ def collect_samples(
     reader: TimedJointReader, *, samples: int, period_s: float, stream: TextIO,
     camera: DiagnosticCamera | None = None,
 ) -> None:
+    """関節→任意の画像の順に指定回数取得し、各区間と取得間隔をJSONLへ記録する。
+
+    period_sは読取り開始から次回開始までの目安。遅れを取り戻すための連続取得はしない。
+    カメラを使う場合は所要時間の集計も出すが、関節と画像のセンサー同期は行わない。
+    """
     previous_start = None
     measurements = {key: [] for key in ("joint_read_s", "image_read_s", "joint_to_image_gap_s", "start_interval_s")}
     for index in range(samples):
@@ -161,6 +189,11 @@ def collect_samples(
 
 
 def run_worker(args: argparse.Namespace, stream: TextIO) -> int:
+    """模擬または実機の読取り診断を実行する。正常終了0、取得・終了処理の異常1。
+
+    実機では設定照合後に取得する。例外時もカメラとバスの解放を試みるが、
+    診断によってモーターのトルク状態を変えないようdisable_torque=Falseで切断する。
+    """
     bus = None
     camera = None
     stage = "calibration"
@@ -249,7 +282,13 @@ def stop_worker(process: subprocess.Popen) -> bool:
 
 
 def supervise(command: list[str], stream: TextIO, timeout_s: float, *, stderr=subprocess.DEVNULL) -> int:
-    """子のログを保存し、完了待ち上限・割込み・異常終了を明示する。再起動しない。"""
+    """子の標準出力をログへ接続し、完了期限・割込み・異常終了を監視する。
+
+    timeout_sは初期化と終了処理を含む子全体の秒数。成功0、子の異常終了1、
+    時間切れ124、親への割込み130を返す。子を自動再起動しない。
+    terminateで停止しない場合はkillも試みるため、子のfinally実行は保証されない。
+    これはプロセスの監視であり、物理的なモーター停止を保証するものではない。
+    """
     process = subprocess.Popen(command, stdout=stream, stderr=stderr, start_new_session=True)
     try:
         code = process.wait(timeout=timeout_s)
@@ -270,6 +309,7 @@ def supervise(command: list[str], stream: TextIO, timeout_s: float, *, stderr=su
 
 
 def parser() -> argparse.ArgumentParser:
+    """模擬診断を既定とし、取得周期・期限・明示的な実機指定を受け取る引数を定義する。"""
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--backend", choices=("fake", "hardware"), default="fake")
     result.add_argument("--output", type=Path, required=True, help="New JSONL file; never overwritten")
@@ -292,6 +332,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """引数を検査し、既存ファイルを上書きしない出力先を用意して診断の子を監視する。"""
     cli = parser()
     arguments = list(sys.argv[1:] if argv is None else argv)
     args = cli.parse_args(arguments)

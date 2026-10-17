@@ -2,6 +2,12 @@
 
 既定は指定時間の継続読取りのみ。--executeでFollower全軸を有効化し、終了時に解除する。
 アーム支持・落下防止を用意し、最初は缶なしで小さく操作する。
+
+Leaderは人が動かす手本側、Followerはその姿勢へ追従する実行側。
+各周期でLeaderとFollowerを読み、Leaderの絶対位置をFollowerの目標として扱う。
+ログのleaderは要求位置、sent_targetは制限・丸め後の送信位置、observationは
+送信前に読んだFollowerの実測位置。この3つを分けて残し、再生・比較に使う。
+F1〜F5は度、F6（gripper）は校正範囲を0〜100に換算したポイントを使う。
 """
 
 import argparse
@@ -20,6 +26,7 @@ from src.control.safe_record_loop import RecordFault, SafeRecordLoop
 from src.control.timed_observation import JointReadError, TimedJointReader
 
 
+# 30秒の案内を基準にし、実行時間に合わせて比例配分する。時刻は自動動作の指令ではない。
 PICK_PLACE_GUIDE = (
     (0, "settle", "Leaderを静止し、Followerの追従を待ちます。"),
     (3, "approach", "爪を開き、缶があった位置の上へ近づけます。爪先を机から離してください。"),
@@ -33,7 +40,11 @@ PICK_PLACE_GUIDE = (
 
 
 def show_guide(stream, elapsed_s, previous_phase, next_frame_index, duration_s=30):
-    """人への案内を記録するだけ。関節指令や工程の完了判定には使わない。"""
+    """経過秒数に応じた案内を、工程の切替時だけ表示・記録し、現在の工程名を返す。
+
+    next_frame_indexは案内と直後の観測をログ上で対応づける番号。
+    人への案内を記録するだけで、関節指令や工程の完了判定には使わない。
+    """
     _, phase, instruction = next(row for row in reversed(PICK_PLACE_GUIDE)
                                  if elapsed_s >= row[0]*duration_s/30)
     instruction = instruction.format(duration_s=duration_s)
@@ -45,6 +56,12 @@ def show_guide(stream, elapsed_s, previous_phase, next_frame_index, duration_s=3
 
 
 def positions_from_raw(raw, calibration):
+    """モーター名→整数tickの辞書を、<motor>.pos→位置の辞書へ換算する。
+
+    腕は校正区間の中点を0度とし、4095 ticksを360度として換算する。
+    爪は校正下限を0、上限を100とする。爪の範囲外を丸め込むと異常を隠すため
+    JointReadErrorにする。腕を含む6軸全体の範囲検査は呼出し側のguardで行う。
+    """
     result = {}
     for motor in MOTOR_IDS:
         low, high = calibration[motor]["range_min"], calibration[motor]["range_max"]
@@ -70,6 +87,11 @@ def positions_from_raw(raw, calibration):
 
 
 def raw_from_positions(action, calibration):
+    """正規化した6軸の位置を、送信可能な整数tickへ逆変換して丸める。
+
+    入力の範囲検査は行わない。丸め前後で値がわずかに変わるので、送信経路では
+    整数化した値をpositions_from_rawで戻し、実際の送信候補として再検査する。
+    """
     raw = {}
     for motor in MOTOR_IDS:
         low, high = calibration[motor]["range_min"], calibration[motor]["range_max"]
@@ -80,7 +102,11 @@ def raw_from_positions(action, calibration):
 
 
 class RawReader:
-    """生値を保持し、Leader F6だけ明示した微小な端点超過を入力処理する。"""
+    """TimedJointReaderへ接続する読取りアダプター。補正前の生値もrawに保持する。
+
+    Leader F6だけ、指定した微小な端点超過を校正端へそろえて入力に使える。
+    調整内容はgripper_adjustmentに残し、Followerの測定値にはこの処理を適用しない。
+    """
 
     def __init__(self, bus, calibration, *, role, gripper_tolerance_ticks=0):
         self.bus, self.calibration = bus, calibration
@@ -94,6 +120,11 @@ class RawReader:
         self.gripper_adjustment = None
 
     def sync_read(self, register, *, normalize, num_retry):
+        """生値を取得し、モーター名→換算位置を返す。端点調整情報は毎回更新する。
+
+        normalize引数は読取り側の共通インターフェースに合わせて受け取るが、
+        バスには常にnormalize=Falseを渡し、このクラスで校正に基づいて換算する。
+        """
         self.raw = self.bus.sync_read(register, normalize=False, num_retry=num_retry)
         self.gripper_adjustment = None
         converted_raw = self.raw
@@ -138,6 +169,11 @@ class TeleopDisplay:
         self.next_status_at = 0.0
 
     def update(self, leader, follower, adjustment, now):
+        """両機の共通範囲への接近とLeader爪の調整を表示する。nowは単調時計の秒数。
+
+        端点の警告は5度または5ポイント以内で表示し、同じ警告を毎周期は出さない。
+        ここで示す範囲は入力・指令の照合用で、物理的な接触の検出ではない。
+        """
         warnings = []
         for key, low, high, unit in self.bounds:
             value = leader[key]
@@ -176,20 +212,29 @@ class TeleopDisplay:
 
 
 class FollowerSender:
+    """校正に基づく丸めと生値送信を、SafeRecordLoopの呼出し形式へ合わせる。"""
+
     def __init__(self, bus, calibration):
         self.bus, self.calibration = bus, calibration
 
     def quantize(self, pair):
+        """(指令, 観測)を受け取り、整数tickに丸めた後の指令位置を返す。送信はしない。"""
         # 丸め後の実際の送信候補も、既存ループで送信前に検査する。
         return positions_from_raw(raw_from_positions(pair[0], self.calibration), self.calibration)
 
     def send_action(self, action):
+        """6軸の目標位置を1回同期書込みし、送った目標を換算して返す。実測値ではない。"""
         raw = raw_from_positions(action, self.calibration)
         self.bus.sync_write("Goal_Position", raw, normalize=False, num_retry=0)
         return positions_from_raw(raw, self.calibration)
 
 
 def motion_policy(guard):
+    """テレオペと固定再生で共用する、1指令2単位・毎秒20単位の変化制限を作る。
+
+    単位は各軸のguardに従う。通信・観測の時間上限も設定するが、
+    実測速度や衝突を制限する機能ではない。
+    """
     return MotionGuard(
         limits=tuple(JointMotionLimit(b.action_key, b.unit, max_step=2.0, max_speed=20.0)
                      for b in guard.bounds),
@@ -199,7 +244,13 @@ def motion_policy(guard):
 
 
 def limited_target(desired, previous, calibration, elapsed_s, policy):
-    """絶対目標への追従速度を制限する。丸め後も上限を越えないtick幅で生成する。"""
+    """前回の送信目標previousから、絶対目標desiredへ進む次の指令を作る。
+
+    elapsed_sは前回送信からの秒数。各軸で1回の変化上限と速度×時間の小さい方を
+    使い、整数tick数へ切り捨ててから目標へ近づける。許容量が1 tick未満なら据え置く。
+    これにより換算時の丸めで上限を越えるのを避ける。観測の鮮度や実際の送信間隔は
+    この関数では検査せず、SafeRecordLoop内のMotionGuardが送信直前に検査する。
+    """
     desired_raw = raw_from_positions(desired, calibration)
     previous_raw = raw_from_positions(previous, calibration)
     result = {}
@@ -215,6 +266,10 @@ def limited_target(desired, previous, calibration, elapsed_s, policy):
 
 
 def check_leader_target(desired, follower_guard):
+    """Leaderの要求がFollowerの校正範囲でも有効かを確認し、違反はJointReadErrorにする。
+
+    両機の校正範囲は同じとは限らないため、Leader自身の読取り検査とは別に必要。
+    """
     checked = follower_guard.check(desired)
     if not checked.accepted:
         error = JointReadError("Invalid Leader target: " + "; ".join(checked.reasons))
@@ -246,6 +301,12 @@ def release_follower(bus, enabled, stream):
 
 
 def run_worker(args, stream):
+    """接続・照合・周期処理・解除を担当する子プロセス側の入口。
+
+    --execute時は現在位置を目標へ設定してからFollowerを有効化し、約0.1秒ごとに
+    読取り→目標生成→検査・送信→JSONL記録を行う。Leaderのトルクは有効化しない。
+    有効化を試みた軸は例外時も解除対象とする。成功は0、処理や終了操作の失敗は1。
+    """
     buses = {}
     enabled = []
     failed = False
@@ -350,6 +411,7 @@ def run_worker(args, stream):
             reading_role = "follower"
             observed = readers["follower"].read()
             reading_role = None
+            # Follower読取りの間にもLeaderの観測は古くなるため、両方を読んだ後で確認する。
             if time.monotonic()-leader.read_started_at > 0.25:
                 raise ValueError("Leader observation is stale")
             desired = leader.as_observation()
@@ -407,6 +469,7 @@ def run_worker(args, stream):
                   file=sys.stderr, flush=True)
         emit(stream, "fault", stage=stage, error_type=type(exc).__name__, **details)
     finally:
+        # 解除処理自体が例外になっても、さらに内側のfinallyで接続を閉じる。
         try:
             if enabled:
                 failed |= not release_follower(buses["follower"], enabled, stream)
@@ -427,6 +490,11 @@ def run_worker(args, stream):
 
 
 def main(argv=None):
+    """引数・校正を事前検査し、新規ログへ出力する監視付きテレオペを起動する。
+
+    親は実行期限を監視し、子が機器を所有する。--_workerはその内部呼出し用。
+    読取り専用と実行モードのどちらでも、既存ログは上書きしない。
+    """
     cli = argparse.ArgumentParser(description=__doc__)
     for role in ("leader", "follower"):
         cli.add_argument(f"--{role}-port", required=True)

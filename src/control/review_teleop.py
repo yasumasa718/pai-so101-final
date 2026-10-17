@@ -1,4 +1,10 @@
-"""正常終了したテレオペログを図・CSV・姿勢候補へ整理する。実機接続・再生は行わない。"""
+"""正常終了したテレオペログを図・CSV・姿勢候補へ整理する。実機接続・再生は行わない。
+
+guarded_teleopのJSONLを読み、Leader・送信目標・Follower実測値の時間変化を比較する。
+--pose NAME=SECONDSで人が指定した時刻に近いフレームを抽出する。
+出力のselected_poses.jsonは固定再生の要所指定に使えるが、抽出自体は把持や投入の
+成否を判定しない。時刻0はログ全体の開始ではなく、最初のframeの観測開始とする。
+"""
 
 import argparse
 import csv
@@ -16,6 +22,12 @@ FIELDS = ("leader", "sent_target", "observation")
 
 
 def parse_frames(text):
+    """JSONL文字列を検査して(plan, frames)を返す。不完全な実行ログはValueError。
+
+    実行済み・FAULTなし・正常終了・全軸トルクOFFの確認を要求する。
+    さらに時刻の増加と3種類の6軸値を確認する。フレーム番号の連続性や
+    再生用校正範囲との照合は、この後のguarded_replay.prepareで行う。
+    """
     records = [json.loads(line) for line in text.splitlines() if line.strip()]
     if (not records or records[-1].get("event") != "complete"
             or records[-1].get("executed") is not True
@@ -46,10 +58,16 @@ def parse_frames(text):
 
 
 def load_frames(path):
+    """UTF-8のログを読み込み、parse_framesと同じ検査済みの組を返す。"""
     return parse_frames(path.read_text(encoding="utf-8"))
 
 
 def select_poses(frames, requests):
+    """NAME=SECONDSの各指定に最も近い観測フレームを、指定順に返す。
+
+    時刻は最初の観測からの秒数。補間はせず、元フレームの番号・観測・送信目標を
+    保存する。等距離なら先のフレームを選ぶ。名前の重複や時間範囲外は拒否する。
+    """
     times = [row["read_started_at"]-frames[0]["read_started_at"] for row in frames]
     poses = []
     names = set()
@@ -70,6 +88,10 @@ def select_poses(frames, requests):
 
 
 def save_plot(frames, poses, path):
+    """6軸それぞれの要求・送信・実測の3系列と、選んだ要所の時刻を画像へ描く。
+
+    Aggを使うので画面表示は不要。描画や保存が失敗してもfigureを閉じる。
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -104,6 +126,7 @@ def save_plot(frames, poses, path):
 
 
 def main(argv=None):
+    """新規フォルダーへ推移図PNG・全関節CSV・姿勢候補JSONをまとめて保存する。"""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, help="新規の保存先（省略時は日時付き）")

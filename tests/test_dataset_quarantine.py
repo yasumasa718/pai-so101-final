@@ -1,4 +1,9 @@
-"""一時ディレクトリで使用禁止の印を検証し、実際の画像保存処理に異常を起こして確認する。"""
+"""データセットの使用禁止マーカーと、画像保存異常後の再利用拒否を検証する。
+
+前半は一時フォルダーの印ファイル、後半は実LeRobotの画像保存スレッドを対象にする。
+Eventで保存を待たせ、時間切れ後に出力が完了してもFAULTと使用禁止が残ることを確認する。
+モーターは模擬し、実機やカメラには接続しない。
+"""
 
 from __future__ import annotations
 
@@ -32,12 +37,14 @@ CAMERA = "observation.images.top"
 
 
 def mark(root: Path) -> Path:
+    """保存結果不明の状態として、2保留フレーム・1保存済みエピソードの使用禁止印を作る。"""
     return record_dataset_quarantine(root, stage="save_episode", error_type="OSError",
                                      commit_uncertain=True, cleanup_uncertain=False,
                                      frames_in_episode=2, saved_episodes=1)
 
 
 def test_marker_is_exclusive_preserves_data_and_excludes_root(tmp_path: Path) -> None:
+    """既存データを変更せず必要最小限の印を新規保存し、再作成で上書きせずデータセットを使用禁止にすることを確認する。"""
     data = tmp_path / "existing.parquet"
     data.write_bytes(b"existing partial dataset bytes")
     marker = mark(tmp_path)
@@ -55,6 +62,7 @@ def test_marker_is_exclusive_preserves_data_and_excludes_root(tmp_path: Path) ->
 
 @pytest.mark.parametrize("contents", [b"", b"broken JSON", b'{"status": "approved"}'])
 def test_any_existing_marker_blocks_reuse(tmp_path: Path, contents: bytes) -> None:
+    """空・壊れたJSON・承認を装う内容でも、印の存在だけで再利用を拒否し、その内容を上書きしないことを確認する。"""
     (tmp_path / QUARANTINE_FILENAME).write_bytes(contents)
     with pytest.raises(DatasetQuarantinedError):
         assert_dataset_not_quarantined(tmp_path)
@@ -63,6 +71,7 @@ def test_any_existing_marker_blocks_reuse(tmp_path: Path, contents: bytes) -> No
 
 
 def test_marker_symlink_is_never_followed(tmp_path: Path) -> None:
+    """印がシンボリックリンクでも使用禁止にし、リンク先のファイルを書き換えないことを確認する。"""
     outside = tmp_path / "outside.json"
     outside.write_bytes(b"unchanged")
     marker = tmp_path / QUARANTINE_FILENAME
@@ -74,6 +83,7 @@ def test_marker_symlink_is_never_followed(tmp_path: Path) -> None:
 
 
 def test_missing_root_is_not_created_by_quarantine(tmp_path: Path) -> None:
+    """異常処理のために存在しないデータセットルートを新規作成しないことを確認する。"""
     missing = tmp_path / "missing"
     with pytest.raises(ValueError):
         mark(missing)
@@ -81,6 +91,7 @@ def test_missing_root_is_not_created_by_quarantine(tmp_path: Path) -> None:
 
 
 def test_failed_marker_creation_still_excludes_root_in_this_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """印の作成権限がなくても、同一プロセス内の使用禁止記録で再利用を防ぐことを確認する。"""
     open_path = Path.open
 
     def deny(path: Path, *args: Any, **kwargs: Any) -> Any:
@@ -98,6 +109,7 @@ def test_failed_marker_creation_still_excludes_root_in_this_process(tmp_path: Pa
 
 @dataclass
 class FakeRobot:
+    """校正照合用情報を持ち、送信履歴と爪49の戻り値を返す代役。実接続・切断は認めない。"""
     calibration: dict[str, Any]
     config: Any = field(default_factory=lambda: type("Config", (), {"use_degrees": True})())
     calls: list[dict[str, float]] = field(default_factory=list)
@@ -115,6 +127,7 @@ class FakeRobot:
 
 @dataclass
 class Recording:
+    """実Dataset・writer・セッション・模擬ロボットをまとめ、異常後の各状態を照合するための入れ物。"""
     dataset: LeRobotDataset
     writer: DatasetRecordWriter
     session: SafeRecordSession
@@ -123,6 +136,10 @@ class Recording:
 
 @pytest.fixture
 def make_recording(tmp_path: Path) -> Iterator[Callable[[str], Recording]]:
+    """実画像保存スレッド付きDatasetを作る関数を提供し、テスト後に元スレッドとファイルを閉じるfixture。
+
+    後片付けはテスト用の資源解放であり、使用禁止印やFAULTを消して復旧させる処理ではない。
+    """
     resources: list[tuple[LeRobotDataset, Any]] = []
 
     def create(mode: str = "image") -> Recording:
@@ -165,11 +182,13 @@ def make_recording(tmp_path: Path) -> Iterator[Callable[[str], Recording]]:
 
 
 def frame(recording: Recording) -> None:
+    """一定の64×64画像と6軸指令を、現在のセッションへ1フレーム追加する。"""
     action = {key: 50.0 if key == "gripper.pos" else 0.0 for key in JOINTS}
     recording.session.record_frame(action, {**action, "top": np.full((64, 64, 3), 100, dtype=np.uint8)})
 
 
 def assert_excluded(recording: Recording, *, commit_uncertain: bool) -> None:
+    """各層のFAULT、保存・破棄・終了・追加送信・新writerの禁止を共通検査する。"""
     assert recording.session.state is SessionState.FAULT
     assert recording.session.loop.state is RecordState.FAULT
     assert recording.writer.state is WriterState.FAULT
@@ -197,6 +216,10 @@ def assert_excluded(recording: Recording, *, commit_uncertain: bool) -> None:
 def test_real_worker_hang_is_bounded_and_late_output_stays_quarantined(
     make_recording: Callable[[str], Recording], monkeypatch: pytest.MonkeyPatch, mode: str, operation: str,
 ) -> None:
+    """画像・動画の保存／破棄／終了待ちを時間切れにし、遅れて画像が完成しても使用禁止を維持することを確認する。
+
+    前エピソードの保存結果と印の内容を保ち、書込み中のファイルを削除しないことも確かめる。
+    """
     recording = make_recording(mode)
     recording.session.start()
     frame(recording)
@@ -260,6 +283,7 @@ def test_real_worker_hang_is_bounded_and_late_output_stays_quarantined(
 
 
 def test_stopped_worker_is_rejected_before_session_start(make_recording: Callable[[str], Recording]) -> None:
+    """保存スレッドが既に停止している場合、開始前に拒否し、送信せず使用禁止にすることを確認する。"""
     recording = make_recording("image")
     recording.dataset.writer.image_writer.native.stop()
     with pytest.raises(ImageWorkerError, match="stopped"):
@@ -270,6 +294,7 @@ def test_stopped_worker_is_rejected_before_session_start(make_recording: Callabl
 
 
 def test_external_marker_added_after_construction_blocks_start(make_recording: Callable[[str], Recording]) -> None:
+    """オブジェクト構築後に外から印が追加されても、開始時に再確認して送信前に拒否することを確認する。"""
     recording = make_recording("image")
     mark(recording.dataset.root)
     with pytest.raises(DatasetQuarantinedError):
@@ -279,6 +304,7 @@ def test_external_marker_added_after_construction_blocks_start(make_recording: C
 
 
 def test_external_marker_added_during_episode_blocks_next_send(make_recording: Callable[[str], Recording]) -> None:
+    """開始後に外から追加された印も次フレームで検出し、送信・中断による削除を防ぐことを確認する。"""
     recording = make_recording("image")
     recording.session.start()
     mark(recording.dataset.root)
@@ -295,6 +321,7 @@ def test_external_marker_added_during_episode_blocks_next_send(make_recording: C
 def test_real_worker_shutdown_timeout_keeps_saved_dataset_quarantined(
     make_recording: Callable[[str], Recording], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """画像保存済みでもスレッドの終了が遅れる場合、終了待ちを時間切れにしてデータセットを使用禁止にすることを確認する。"""
     exited_loop, release = threading.Event(), threading.Event()
     native_loop = image_writer.worker_thread_loop
 
@@ -323,6 +350,7 @@ def test_real_worker_shutdown_timeout_keeps_saved_dataset_quarantined(
 def test_partial_marker_write_blocks_reuse_without_claiming_record_success(
     make_recording: Callable[[str], Recording], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """印の書込みが途中で失敗しても不完全な印で再利用を防ぎ、印の保存成功とは報告しないことを確認する。"""
     recording = make_recording("image")
     recording.session.start()
     frame(recording)
@@ -355,6 +383,7 @@ def test_partial_marker_write_blocks_reuse_without_claiming_record_success(
 def test_quarantine_record_io_error_does_not_mask_original_save_fault(
     make_recording: Callable[[str], Recording], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """印を作れない失敗が重なっても元の保存例外をそのまま伝え、メモリ上の使用禁止を維持することを確認する。"""
     recording = make_recording("image")
     recording.session.start()
     frame(recording)
@@ -390,6 +419,7 @@ def test_quarantine_record_io_error_does_not_mask_original_save_fault(
 def test_partial_native_save_creates_marker_without_raw_exception_details(
     make_recording: Callable[[str], Recording], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """実保存後の例外で印を作り、秘密を含む例外本文や絶対パスを印へ転記しないことを確認する。"""
     recording = make_recording("image")
     recording.session.start()
     frame(recording)

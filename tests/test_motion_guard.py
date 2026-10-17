@@ -1,4 +1,8 @@
-"""指令の変化量と時間の検査を、すべて Fake Robot で確認する。"""
+"""指令の変化量・変化速度・観測の鮮度・送信所要時間を模擬ロボットで検証する。
+
+FakeClockの時刻を直接動かし、境界ちょうど・超過・逆行を再現する。送信前の拒否と
+送信後の異常を区別し、最後に実LeRobotDatasetへの画像付き保存との結合も確認する。
+"""
 
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ CAPTURE = 9.9375  # 2 進数で正確に表せる値を使い、丸め誤差で�
 
 
 def positions(**changes: float) -> dict[str, float]:
+    """腕0度・爪50ポイントの基準姿勢へ、指定した関節値だけを上書きして返す。"""
     return {**{key: 50.0 if key == "gripper.pos" else 0.0 for key in JOINTS}, **changes}
 
 
@@ -42,6 +47,7 @@ def policy() -> MotionGuard:
 
 @dataclass
 class FakeClock:
+    """nowをそのまま返す模擬時計。テストや模擬送信先が明示的に時刻を進める。"""
     now: float = 10.0
 
     def __call__(self) -> float:
@@ -50,11 +56,13 @@ class FakeClock:
 
 @dataclass
 class FakeConfig:
+    """開始前照合に必要なuse_degreesだけを持つ、実機接続のない設定。"""
     use_degrees: bool = True
 
 
 @dataclass
 class FakeRobot:
+    """送信履歴・所要時間・例外・爪の戻り値を制御できる送信先。接続と切断は呼ばれたら失敗にする。"""
     clock: FakeClock
     calls: list[dict[str, float]] = field(default_factory=list)
     returned_gripper: float | None = None
@@ -82,6 +90,7 @@ class FakeRobot:
 
 @dataclass
 class Context:
+    """開始済みループと、その送信先・時計・保存履歴を一緒に操作するための入れ物。"""
     loop: SafeRecordLoop
     robot: FakeRobot
     clock: FakeClock
@@ -90,6 +99,7 @@ class Context:
 
 @pytest.fixture
 def context() -> Context:
+    """校正範囲とテスト用の動作制限を組み合わせ、開始済みループを用意するfixture。"""
     path = Path(__file__).resolve().parents[1] / "configs/calibration_snapshots/my_follower_for_004.json"
     gate = ActionGuard.from_calibration(path)
     clock = FakeClock()
@@ -103,6 +113,7 @@ def context() -> Context:
 
 def rejected(context: Context, action: dict[str, float], capture: Any = CAPTURE,
              observation: dict[str, Any] | None = None, stage: str = "motion_guard") -> RecordFault:
+    """送信前の拒否に共通する条件を検査する。指定段階でFAULTとなり、送信・保存回数が増えず再開もできないことを確かめる。"""
     sends, writes = len(context.robot.calls), len(context.saved)
     with pytest.raises(RecordFault) as caught:
         context.loop.process_frame(action, positions() if observation is None else observation, observation_time=capture)
@@ -120,6 +131,7 @@ def rejected(context: Context, action: dict[str, float], capture: Any = CAPTURE,
 
 
 def test_valid_multiple_frames_use_real_capture_time_and_returned_target(context: Context) -> None:
+    """送信戻り値を記録・履歴に使い、呼出し側が返却辞書を変更しても次回の基準が壊れないことを確認する。"""
     context.robot.returned_gripper = 49.0
     first = context.loop.process_frame(positions(), positions(), observation_time=CAPTURE)
     assert first.sent_action["gripper.pos"] == 49.0
@@ -136,12 +148,14 @@ def test_valid_multiple_frames_use_real_capture_time_and_returned_target(context
 
 @pytest.mark.parametrize("joint, value", [("shoulder_lift.pos", 2.0), ("wrist_flex.pos", -2.0), ("gripper.pos", 54.0)])
 def test_step_and_rate_boundaries_are_inclusive(context: Context, joint: str, value: float) -> None:
+    """腕・爪の変化量と速度が上限ちょうどの指令は受理することを確認する。"""
     result = context.loop.process_frame(positions(**{joint: value}), positions(), observation_time=CAPTURE)
     assert result.sent_action[joint] == value
 
 
 @pytest.mark.parametrize("joint, value", [("shoulder_lift.pos", 2.01), ("wrist_flex.pos", -2.01), ("gripper.pos", 54.01)])
 def test_initial_step_violation_is_refused_without_clipping(context: Context, joint: str, value: float) -> None:
+    """初回観測からの変化量が上限を少し越えると、入力を補正せず送信前に拒否することを確認する。"""
     action = positions(**{joint: value})
     before = dict(action)
     fault = rejected(context, action, capture=9.875)
@@ -151,17 +165,20 @@ def test_initial_step_violation_is_refused_without_clipping(context: Context, jo
 
 @pytest.mark.parametrize("joint, value", [("shoulder_lift.pos", 1.0), ("wrist_flex.pos", -1.0), ("gripper.pos", 52.0)])
 def test_initial_rate_violation_with_valid_small_step(context: Context, joint: str, value: float) -> None:
+    """変化量自体は小さくても経過時間が短く速度上限を越える場合、送信前に拒否することを確認する。"""
     fault = rejected(context, positions(**{joint: value}), capture=9.984375)
     assert "target rate" in fault.fault.message
 
 
 def test_first_reference_is_measured_observation_not_zero(context: Context) -> None:
+    """初回の基準を0度と仮定せず、その場の観測位置に置くことを確認する。"""
     obs = positions(**{"shoulder_lift.pos": 10.0, "gripper.pos": 70.0})
     result = context.loop.process_frame(obs, obs, observation_time=CAPTURE)
     assert result.sent_action == obs
 
 
 def test_later_step_uses_returned_target_instead_of_previous_request(context: Context) -> None:
+    """次回の変化量は前回要求50ではなく送信戻り値46を基準にし、目標51への5ポイント差を拒否することを確認する。"""
     context.robot.returned_gripper = 46.0
     context.loop.process_frame(positions(), positions(), observation_time=CAPTURE)
     context.robot.returned_gripper = None
@@ -172,6 +189,7 @@ def test_later_step_uses_returned_target_instead_of_previous_request(context: Co
 
 
 def test_later_rate_uses_previous_send_return_time(context: Context) -> None:
+    """前回の送信開始でなく戻り時刻から速度を評価し、通信待ち時間で許容量を増やさないことを確認する。"""
     context.robot.delay = 0.03125
     context.loop.process_frame(positions(), positions(), observation_time=CAPTURE)
     context.robot.delay = 0.0
@@ -182,11 +200,13 @@ def test_later_rate_uses_previous_send_return_time(context: Context) -> None:
 
 
 def test_processor_modified_final_candidate_is_checked(context: Context) -> None:
+    """ロボット側の加工が作った大きな最終指令も、送信直前の動作検査で拒否することを確認する。"""
     context.loop.robot_action_processor = lambda p: {**p[0], "wrist_flex.pos": 3.0}
     rejected(context, positions())
 
 
 def test_processor_cannot_replace_initial_measured_reference(context: Context) -> None:
+    """加工処理が受け取った観測辞書を変更しても、事前に保持した比較用の実測位置は変わらないことを確認する。"""
     def altered(payload: tuple[dict[str, float], dict[str, Any]]) -> dict[str, float]:
         action, obs = payload
         obs["wrist_flex.pos"] = 3.0
@@ -197,6 +217,7 @@ def test_processor_cannot_replace_initial_measured_reference(context: Context) -
 
 
 def test_time_is_checked_after_slow_processors(context: Context) -> None:
+    """加工処理の間に観測が古くなった場合、加工前の時刻で通さず送信直前に拒否することを確認する。"""
     def slow(payload: tuple[dict[str, float], dict[str, Any]]) -> dict[str, float]:
         context.clock.now += 0.25
         return payload[0]
@@ -207,21 +228,25 @@ def test_time_is_checked_after_slow_processors(context: Context) -> None:
 
 @pytest.mark.parametrize("capture", [None, True, "9.9", float("nan"), float("inf"), 10.01, 9.75])
 def test_missing_invalid_future_or_stale_observation_time(context: Context, capture: Any) -> None:
+    """取得時刻の欠損・型不正・非有限値・未来・期限切れを送信前に拒否することを確認する。"""
     rejected(context, positions(), capture=capture)
 
 
 @pytest.mark.parametrize("capture", [10.0, 9.99609375])
 def test_zero_or_too_short_initial_interval_rejects_even_same_target(context: Context, capture: float) -> None:
+    """目標を変えない場合でも、初回の観測から検査までの時間が0または短すぎれば拒否することを確認する。"""
     assert "interval" in rejected(context, positions(), capture=capture).fault.message
 
 
 def test_reused_observation_is_refused(context: Context) -> None:
+    """前フレームと同じ取得時刻の観測を再利用して次の指令を送れないことを確認する。"""
     context.loop.process_frame(positions(), positions(), observation_time=CAPTURE)
     context.clock.now = 10.03125
     assert "reused" in rejected(context, positions(), capture=CAPTURE).fault.message
 
 
 def test_newer_observation_predating_previous_send_return_is_refused(context: Context) -> None:
+    """前の観測より新しくても、前回送信完了より前の観測は次の指令に使えないことを確認する。"""
     context.loop.process_frame(positions(), positions(), observation_time=CAPTURE)
     context.clock.now = 10.03125
     assert "predates" in rejected(context, positions(), capture=9.984375).fault.message
@@ -229,6 +254,7 @@ def test_newer_observation_predating_previous_send_return_is_refused(context: Co
 
 @pytest.mark.parametrize("advance", [0.0, 1 / 256, 0.5, -0.0625])
 def test_invalid_send_interval_never_resumes_after_pause(context: Context, advance: float) -> None:
+    """連続送信間隔が0・短すぎ・長すぎ・逆行なら、同じ目標でも自動継続できないことを確認する。"""
     context.loop.process_frame(positions(), positions(), observation_time=CAPTURE)
     context.clock.now += advance
     rejected(context, positions(), capture=context.clock.now)
@@ -236,6 +262,7 @@ def test_invalid_send_interval_never_resumes_after_pause(context: Context, advan
 
 @pytest.mark.parametrize("clock_value", [float("nan"), float("inf"), True])
 def test_invalid_monotonic_clock_rejects_before_send(context: Context, clock_value: Any) -> None:
+    """制御側の時計がNaN・無限大・boolを返した場合、送信前に拒否することを確認する。"""
     context.clock.now = clock_value
     rejected(context, positions())
 
@@ -246,16 +273,19 @@ def test_invalid_monotonic_clock_rejects_before_send(context: Context, clock_val
     positions(**{"shoulder_lift.pos": 999.0}),
 ])
 def test_invalid_measured_positions_are_refused(context: Context, observation: dict[str, Any]) -> None:
+    """比較基準の観測に欠損・NaN・範囲外があれば、指令が正常でも送信前に拒否することを確認する。"""
     rejected(context, positions(), observation=observation, stage="motion_observation_guard")
 
 
 def test_camera_fields_do_not_become_motion_reference(context: Context) -> None:
+    """画像を含む観測でも6軸だけを動作検査へ取り出し、画像を関節値と誤認しないことを確認する。"""
     context.loop.process_frame(positions(), {**positions(), "top": np.zeros((4, 4, 3), dtype=np.uint8)}, observation_time=CAPTURE)
     assert len(context.robot.calls) == 1
 
 
 @pytest.mark.parametrize("boundary", ["initial_minimum", "initial_max_age", "subsequent_maximum", "send_duration"])
 def test_timing_limit_boundaries_are_inclusive(context: Context, boundary: str) -> None:
+    """初回最短間隔・観測最大鮮度・次回最長間隔・最大送信時間の境界ちょうどを受理することを確認する。"""
     capture = CAPTURE
     if boundary == "initial_minimum":
         capture = context.clock.now - policy().min_interval_s
@@ -273,6 +303,7 @@ def test_timing_limit_boundaries_are_inclusive(context: Context, boundary: str) 
 
 @pytest.mark.parametrize("delay", [0.125, -0.015625, float("nan")])
 def test_delayed_or_invalid_send_completion_faults_after_one_attempt(context: Context, delay: float) -> None:
+    """送信戻りの遅延・逆行・NaNは1回の送信後にFAULTとなり、保存や再送を防ぐことを確認する。"""
     context.robot.delay = delay
     with pytest.raises(RecordFault) as caught:
         context.loop.process_frame(positions(), positions(), observation_time=CAPTURE)
@@ -285,6 +316,7 @@ def test_delayed_or_invalid_send_completion_faults_after_one_attempt(context: Co
 
 
 def test_returned_target_motion_violation_cannot_be_recorded(context: Context) -> None:
+    """位置範囲内でも送信戻り値の変化量が大きすぎる場合、送信済みの状態を保持しつつフレーム保存を拒否することを確認する。"""
     context.robot.returned_gripper = 60.0  # 位置の範囲内だが、変化量の検査には通らない条件にする。
     with pytest.raises(RecordFault) as caught:
         context.loop.process_frame(positions(), positions(), observation_time=CAPTURE)
@@ -294,6 +326,7 @@ def test_returned_target_motion_violation_cannot_be_recorded(context: Context) -
 
 
 def test_send_latency_does_not_relax_returned_target_rate_budget(context: Context) -> None:
+    """送信戻り値の速度検査でも送信前に確定した時間枠を使い、送信遅延で許容量を広げないことを確認する。"""
     context.robot.delay = 0.0625
     context.robot.returned_gripper = 51.5
     with pytest.raises(RecordFault) as caught:
@@ -306,6 +339,7 @@ def test_send_latency_does_not_relax_returned_target_rate_budget(context: Contex
 
 @pytest.mark.parametrize("error", [OSError("uncertain serial send"), KeyboardInterrupt()])
 def test_motion_gate_does_not_retry_or_disconnect_on_send_failure(context: Context, error: BaseException) -> None:
+    """通信例外・割込み時は送信結果不明を保持し、ループ自身の再送・切断を行わないことを確認する。"""
     context.robot.error = error
     expected = KeyboardInterrupt if isinstance(error, KeyboardInterrupt) else RecordFault
     with pytest.raises(expected):
@@ -318,6 +352,7 @@ def test_motion_gate_does_not_retry_or_disconnect_on_send_failure(context: Conte
 
 
 def test_frame_write_failure_does_not_erase_physical_send_history(context: Context) -> None:
+    """保存失敗でも検査済み送信目標と戻り時刻の履歴は残り、未保存フレーム数とは区別されることを確認する。"""
     def failed_write(action: dict[str, float]) -> None:
         raise OSError("partial write")
 
@@ -330,6 +365,7 @@ def test_frame_write_failure_does_not_erase_physical_send_history(context: Conte
 
 
 def test_fresh_loop_sharing_policy_has_no_previous_episode_history(context: Context) -> None:
+    """同じ制限設定を共有する新ループが、前エピソードの送信履歴を引き継がず新しい観測を初期基準にすることを確認する。"""
     context.loop.process_frame(positions(), positions(), observation_time=CAPTURE)
     context.loop.finish()
     other = SafeRecordLoop(context.loop.guard, lambda p: p[0], lambda p: p[0], context.robot,
@@ -340,9 +376,11 @@ def test_fresh_loop_sharing_policy_has_no_previous_episode_history(context: Cont
     assert other.frames_written == 1
 
 
+# デコレーターを重ねると全組合せを試す。4項目×5種類の不正値で20ケースになる。
 @pytest.mark.parametrize("field_name", ["min_interval_s", "max_interval_s", "max_observation_age_s", "max_send_duration_s"])
 @pytest.mark.parametrize("value", [0.0, -1.0, True, float("nan"), float("inf")])
 def test_invalid_time_policy_is_rejected(field_name: str, value: Any) -> None:
+    """4種類の時間制限に0・負数・bool・非有限値を指定できないことを確認する。"""
     with pytest.raises(ValueError):
         replace(policy(), **{field_name: value})
 
@@ -350,6 +388,7 @@ def test_invalid_time_policy_is_rejected(field_name: str, value: Any) -> None:
 @pytest.mark.parametrize("field_name", ["max_step", "max_speed"])
 @pytest.mark.parametrize("value", [0.0, -1.0, True, float("nan"), float("inf")])
 def test_invalid_joint_threshold_is_rejected(field_name: str, value: Any) -> None:
+    """軸ごとの変化量・速度上限に0・負数・bool・非有限値を指定できないことを確認する。"""
     configured = policy()
     with pytest.raises(ValueError):
         replace(configured, limits=(replace(configured.limits[0], **{field_name: value}), *configured.limits[1:]))
@@ -357,6 +396,7 @@ def test_invalid_joint_threshold_is_rejected(field_name: str, value: Any) -> Non
 
 @pytest.mark.parametrize("change", ["missing", "duplicate", "units", "impossible_timing"])
 def test_incomplete_or_incompatible_policy_is_rejected(change: str) -> None:
+    """軸不足・重複・単位不一致・矛盾した時間条件を、動作制限の構築時に拒否することを確認する。"""
     configured = policy()
     with pytest.raises(ValueError):
         if change == "missing":
@@ -370,6 +410,7 @@ def test_incomplete_or_incompatible_policy_is_rejected(change: str) -> None:
 
 
 def test_action_guard_units_must_match_motion_policy(context: Context) -> None:
+    """位置範囲検査器と動作制限の単位が違う場合、ループを構築できないことを確認する。"""
     gate = ActionGuard(tuple(replace(bound, unit="normalized_m100_100") for bound in context.loop.guard.bounds))
     with pytest.raises(ValueError, match="units"):
         SafeRecordLoop(gate, lambda p: p[0], lambda p: p[0], context.robot, lambda a: None, motion_guard=policy())
@@ -377,6 +418,10 @@ def test_action_guard_units_must_match_motion_policy(context: Context) -> None:
 
 @pytest.mark.parametrize("finish", ["save", "reject_then_abort", "send_timing_fault"])
 def test_motion_guard_real_image_dataset_session_lifecycle(tmp_path: Path, finish: str) -> None:
+    """実画像付きデータセットで正常保存と次エピソードの送信前・送信後FAULTを試し、保存済み2フレームだけが残ることを確認する。
+
+    画像、送信戻り値、メタデータを読み戻し、異常なエピソードの明示破棄後も前の保存結果を保持する。
+    """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from PIL import Image
     import io

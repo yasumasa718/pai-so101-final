@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 QUARANTINE_FILENAME = "SO101_QUARANTINE.json"
+# 印の書込み失敗時も同一プロセス内では拒否を継続する。再起動を越えては保持されない。
 _excluded_roots: set[Path] = set()
 
 

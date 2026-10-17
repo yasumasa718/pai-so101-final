@@ -52,7 +52,12 @@ def make_guarded_teleop_pipeline(
 ) -> RobotProcessorPipeline[
     tuple[RobotAction, RobotObservation], RobotAction
 ]:
-    """オフラインテスト用の処理を作る。実機は操作しない。"""
+    """(指令, 観測)を受け、範囲検査した指令を返すLeRobotのパイプラインを作る。
+
+    margin_degは腕の度、margin_gripperは爪の0〜100のポイントで、校正範囲の
+    両端から内側へ取る余白。変換関数はLeRobotの内部形式との橋渡しを行う。
+    この処理自体は時間・変化量の検査や送信を行わない。オフラインテスト用。
+    """
     guard = ActionGuard.from_calibration(
         calibration_path,
         margin_deg=margin_deg,

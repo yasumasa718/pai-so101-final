@@ -48,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 
 class SessionState(str, Enum):
+    """1エピソードの状態。保存または明示的な破棄の後にだけ終了処理へ進める。"""
+
     READY = "ready"  # 開始前。
     RECORDING = "recording"  # フレームを収録できる状態。
     FAULT = "fault"  # 異常を記憶した状態。収録は再開しない。
@@ -101,6 +103,7 @@ class SafeRecordSession:
         if not isinstance(self.writer, DatasetRecordWriter):
             raise TypeError("writer must be a DatasetRecordWriter")
         if self.loop.frame_writer is not self.writer:
+            # 同じwriterに観測を預けて指令を渡さなければ、両者のフレーム対応が崩れる。
             raise ValueError("loop.frame_writer must be this exact DatasetRecordWriter")
         if self.loop.state is not RecordState.READY:
             raise ValueError("loop must be READY and unused")

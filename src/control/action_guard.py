@@ -106,9 +106,12 @@ class ActionGuard:
                 raise ValueError(f"{motor}: invalid calibration range")
 
             if motor == "gripper":
+                # 爪だけは角度ではなく、校正区間の閉じ側〜開き側を0〜100で表す。
                 minimum, maximum, margin = 0.0, 100.0, float(margin_gripper)
                 unit = "normalized_0_100"
             else:
+                # 腕の0度は校正区間の中点。生位置には機器側のhoming_offsetが反映済みなので、
+                # ここでオフセットを加算し直すことはしない。
                 midpoint = (low + high) / 2.0
                 minimum = (low - midpoint) * 360.0 / MAX_TICKS
                 maximum = (high - midpoint) * 360.0 / MAX_TICKS
@@ -145,6 +148,7 @@ class ActionGuard:
             if bound.action_key not in action:
                 continue
             raw = action[bound.action_key]
+            # boolはintの派生型だが、True/Falseを位置指令として受け入れないため型を厳密に見る。
             if type(raw) not in (int, float) or not math.isfinite(raw):
                 reasons.append(f"{bound.action_key}: invalid numeric value {raw!r}")
                 continue

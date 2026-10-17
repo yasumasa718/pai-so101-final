@@ -1,4 +1,8 @@
-"""Unit and small integration tests for the offline SO-101 validator."""
+"""保存済み経路の範囲・欠損・時刻・指令変化・診断レポートをオフラインで検証する。
+
+主に3フレームの小さな経路をメモリで作る。CLIの結合テストだけは一時的な
+Parquetとメタデータを実際に保存して読み戻す。実機の再生や接続は行わない。
+"""
 from __future__ import annotations
 
 import json
@@ -14,6 +18,7 @@ from src.control import validate_trajectory as vt
 
 @pytest.fixture
 def sample() -> tuple[vt.TrajectoryData, tuple[vt.JointMapping, ...], dict[str, vt.MotorCalibration]]:
+    """F4に範囲外指令を1件含み、観測が指令より1フレーム遅れる3行の経路・対応表・校正を作る。"""
     names = tuple(f"{name}.pos" for name in vt.EXPECTED_MOTOR_IDS)
     metadata = vt.DatasetMetadata("v3.0", "so_follower", 30.0, names, names)
     calibration = {
@@ -44,6 +49,7 @@ def sample() -> tuple[vt.TrajectoryData, tuple[vt.JointMapping, ...], dict[str, 
 
 
 def test_limits_and_known_f4_violation(sample):
+    """校正からF4下限を換算し、-108度の違反の件数・行・時刻・最大超過量を特定できることを確認する。"""
     traj, mappings, calibration = sample
     limits = vt.calculate_joint_limits(calibration, mappings)
     f4_limits = next(x for x in limits if x.motor_name == "wrist_flex")
@@ -58,13 +64,17 @@ def test_limits_and_known_f4_violation(sample):
 
 
 def test_integrity_clean(sample):
+    """番号・時刻・値の形式が整った経路は品質検査を通ることを確認する。指令範囲検査とは別の判定。"""
     traj, _, _ = sample
     quality = vt.check_data_integrity(traj)
+    # sampleにはF4の範囲違反があるが、値・番号・時刻のデータ品質自体は正常。
+    # 検査項目ごとのPASSを、経路全体の承認として扱わないことが分かる組合せにしている。
     assert quality.passed
     assert quality.max_observed_dt_seconds == pytest.approx(1 / 30)
 
 
 def test_integrity_catches_missing_nan_time_and_frame(sample):
+    """欠損・NaN・時刻重複・無効時刻・番号の飛びを同時に入れ、それぞれ別の問題として数えることを確認する。"""
     traj, _, _ = sample
     bad_actions = list(traj.actions)
     bad_actions[1] = (math.nan, 0, 0, 0, 0, None)
@@ -85,6 +95,7 @@ def test_integrity_catches_missing_nan_time_and_frame(sample):
 
 
 def test_integrity_gap_threshold_opt_in(sample):
+    """時刻間隔の上限は指定時だけ適用され、負の上限は設定エラーになることを確認する。"""
     traj, _, _ = sample
     assert vt.check_data_integrity(traj).passed
     bad = vt.check_data_integrity(traj, max_gap_seconds=0.03)
@@ -94,6 +105,7 @@ def test_integrity_gap_threshold_opt_in(sample):
 
 
 def test_jumps_no_threshold_not_evaluated_and_threshold(sample):
+    """上限未指定では最大変化を集計しても未評価とし、40度上限の指定でF4の2箇所を違反とすることを確認する。"""
     traj, mappings, _ = sample
     diagnostics = vt.check_position_jumps(traj, mappings)
     f4 = next(x for x in diagnostics if x.motor_name == "wrist_flex")
@@ -107,6 +119,7 @@ def test_jumps_no_threshold_not_evaluated_and_threshold(sample):
 
 
 def test_tracking_lag_is_descriptive(sample):
+    """1フレームずらすと人工的な指令・観測の差が0になることと、負の遅れ指定を拒否することを確認する。"""
     traj, mappings, _ = sample
     results = vt.analyze_tracking_difference(traj, mappings, max_lag_frames=2)
     f4 = [x for x in results if x.motor_name == "wrist_flex"]
@@ -118,6 +131,7 @@ def test_tracking_lag_is_descriptive(sample):
 
 
 def test_report_paths_protect_source_data(tmp_path, sample):
+    """違反と実行不可をJSONへ保存しつつ、データセット内や校正ファイルへのレポート出力を拒否することを確認する。"""
     traj, mapping, cal = sample
     dataset_root = tmp_path / "dataset"
     (dataset_root / "meta").mkdir(parents=True)
@@ -146,6 +160,7 @@ def test_report_paths_protect_source_data(tmp_path, sample):
 
 
 def test_cli_on_parquet_and_json_report(tmp_path, monkeypatch):
+    """実際に作ったParquet・JSONをCLIで読み、F4違反と終了コード3をレポートへ反映する結合テスト。"""
     import pyarrow as pa
     import pyarrow.parquet as pq
     if not hasattr(pa, "Table"):
@@ -196,6 +211,7 @@ def test_cli_on_parquet_and_json_report(tmp_path, monkeypatch):
 
 
 def test_episode_boundary_can_reset_timestamp_and_frame_index(sample):
+    """新しいエピソードで時刻とフレーム番号が0へ戻ることを、逆行や欠損と誤判定しないことを確認する。"""
     traj, _, _ = sample
     new = replace(
         traj,
